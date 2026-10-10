@@ -1,0 +1,12 @@
+[2026-01-04 14:37:29 +0000] [27529] [INFO] Starting gunicorn 23.0.0
+[2026-01-04 14:37:29 +0000] [27529] [ERROR] Connection in use: ('127.0.0.1', 8000)
+[2026-01-04 14:37:29 +0000] [27529] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
+[2026-01-04 14:37:30 +0000] [27529] [ERROR] Connection in use: ('127.0.0.1', 8000)
+[2026-01-04 14:37:30 +0000] [27529] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
+[2026-01-04 14:37:31 +0000] [27529] [ERROR] Connection in use: ('127.0.0.1', 8000)
+[2026-01-04 14:37:31 +0000] [27529] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
+[2026-01-04 14:37:32 +0000] [27529] [ERROR] Connection in use: ('127.0.0.1', 8000)
+[2026-01-04 14:37:32 +0000] [27529] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
+[2026-01-04 14:37:33 +0000] [27529] [ERROR] Connection in use: ('127.0.0.1', 8000)
+[2026-01-04 14:37:33 +0000] [27529] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
+[2026-01-04 14:37:34 +0000] [27529] [ERROR] Can't connect to ('127.0.0.1', 8000)

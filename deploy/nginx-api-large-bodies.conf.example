@@ -1,0 +1,29 @@
+# Fix HTTP 413 on PUT /api/bots/?bot_id=... (large bot flow + design JSON).
+# Merge into your server {} or location /api/ {} block, then: nginx -t && reload nginx
+#
+# The app also sends flow and design as two smaller PUTs when possible; nginx must
+# still allow each request (raise limit if design embeds large base64 assets).
+
+client_max_body_size 100m;
+
+# --- If the browser shows "CORS" only on big PUTs: nginx 413/502 pages often omit CORS headers.
+# Browser then hides the real status. Mirror your SPA origin (same as Django CORS) on errors:
+#
+#   map $http_origin $cors_allow_origin {
+#       default $http_origin;
+#       ''      '';
+#   }
+#   add_header Access-Control-Allow-Origin $cors_allow_origin always;
+#   add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
+#   add_header Access-Control-Allow-Headers "Authorization, Content-Type, Accept" always;
+#   add_header Access-Control-Allow-Credentials "true" always;
+#
+# (Tune $cors_allow_origin to match CORS_ALLOWED_ORIGINS / regex on Django — never use * with credentials.)
+
+# If you terminate TLS at nginx and proxy to gunicorn:
+proxy_connect_timeout 300s;
+proxy_send_timeout 300s;
+proxy_read_timeout 300s;
+
+# Optional: avoid buffering huge bodies to disk in some setups
+# proxy_request_buffering off;

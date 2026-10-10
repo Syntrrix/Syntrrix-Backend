@@ -1,0 +1,8 @@
+nohup: ignoring input
+[2026-01-04 14:37:16 +0000] [27452] [INFO] Starting gunicorn 23.0.0
+[2026-01-04 14:37:16 +0000] [27452] [INFO] Listening at: http://127.0.0.1:8000 (27452)
+[2026-01-04 14:37:16 +0000] [27452] [INFO] Using worker: sync
+[2026-01-04 14:37:16 +0000] [27453] [INFO] Booting worker with pid: 27453
+[2026-01-04 14:37:16 +0000] [27454] [INFO] Booting worker with pid: 27454
+[2026-01-04 14:37:16 +0000] [27455] [INFO] Booting worker with pid: 27455
+[2026-01-04 14:37:16 +0000] [27456] [INFO] Booting worker with pid: 27456
