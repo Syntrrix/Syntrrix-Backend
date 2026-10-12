@@ -24,9 +24,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend codebase
 COPY . /app/
 
-# Make entrypoint script executable
+# Make entrypoint script executable (and strip Windows CRLF line endings)
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 # Expose Django port
 EXPOSE 8000

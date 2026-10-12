@@ -125,9 +125,6 @@ TEMPLATES = [
 WSGI_APPLICATION = "agro_main.wsgi.application"
 
 
-_in_docker = os.path.exists('/.dockerenv')
-_default_db_host = 'db' if _in_docker else 'localhost'
-
 DATABASES = {
     'default': {    
         'ENGINE': os.environ.get('DB_ENGINE', 'django.db.backends.mysql'),
