@@ -28,11 +28,19 @@ COPY . /app/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
+# Create runtime directories for static, media, and persistent storage
+RUN mkdir -p /app/staticfiles /app/media /app/persistent_data
+
 # Expose Django port
 EXPOSE 8000
+
+# Health check to ensure Django is responding
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/ || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
 
-# Default command to run production server with Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "120", "agro_main.wsgi:application"]
+# Production command to run WSGI server with Gunicorn (workers, threads, and container stdout/stderr logging)
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "3", "--threads", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "agro_main.wsgi:application"]
+

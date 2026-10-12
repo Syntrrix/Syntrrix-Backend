@@ -1,0 +1,24 @@
+version: '3.8'
+
+# Development compose file (optional) - enables host code bind mounting and runserver
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agrobridge_backend_dev
+    command: python manage.py runserver 0.0.0.0:8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - backend_staticfiles_dev:/app/staticfiles
+      - backend_mediafiles_dev:/app/media
+      - backend_data_dev:/app/persistent_data
+
+volumes:
+  backend_staticfiles_dev:
+  backend_mediafiles_dev:
+  backend_data_dev:

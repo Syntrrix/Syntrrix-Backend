@@ -125,51 +125,21 @@ TEMPLATES = [
 WSGI_APPLICATION = "agro_main.wsgi.application"
 
 
+# Database configuration loaded dynamically from environment (.env)
 DATABASES = {
-    'default': {    
+    'default': {
         'ENGINE': os.environ.get('DB_ENGINE', 'django.db.backends.mysql'),
-        'NAME': os.environ.get('DB_NAME', 'database-1'),
-        'USER': os.environ.get('DB_USER', 'admin'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', 'b4vmVp&)X2V9'),
-        'HOST': os.environ.get('DB_HOST', 'syntrrix-db.cru0g2ggwfsb.ap-south-1.rds.amazonaws.com'),
+        'NAME': os.environ.get('DB_NAME', ''),
+        'USER': os.environ.get('DB_USER', ''),
+        'PASSWORD': os.environ.get('DB_PASSWORD', ''),
+        'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
         'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+            'charset': 'utf8mb4',
         },
-    },
+    }
 }
-
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'biznex_database',
-#         'USER': 'admin',
-#         'PASSWORD': 'biznex123456',
-#         'HOST': 'biznex-database.ct0okeqiwhi3.ap-south-1.rds.amazonaws.com',
-#         'PORT': '3306',
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#             'charset': 'utf8mb4',
-#         },
-#     }
-# }
-
-# ------ New Db Connection 15-06-2026   ---------------------
-
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'database-1',
-#         'USER': 'admin',
-#         'PASSWORD': 'Database123',
-#         'HOST': 'database-1.ctokeeo06ck9.ap-south-1.rds.amazonaws.com',
-#         'PORT': '3306',
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#             'charset': 'utf8mb4',
-#         },
-#     }
-# }
 
 
 

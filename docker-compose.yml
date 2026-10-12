@@ -11,23 +11,24 @@ services:
       - "8000:8000"
     env_file:
       - .env
-    environment:
-      - SECRET_KEY=${SECRET_KEY:-django-insecure-o-ut=c-(*&@+i$d3@wanni5+_&zvno%iahsq*_w3%4^9@p26=w}
-      - DEBUG=${DEBUG:-True}
-      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-*}
-      - DB_ENGINE=${DB_ENGINE:-django.db.backends.mysql}
-      - DB_NAME=${DB_NAME:-database-1}
-      - DB_USER=${DB_USER:-admin}
-      - DB_PASSWORD=${DB_PASSWORD:-b4vmVp&)X2V9}
-      - DB_HOST=${DB_HOST:-syntrrix-db.cru0g2ggwfsb.ap-south-1.rds.amazonaws.com}
-      - DB_PORT=${DB_PORT:-3306}
-      - CORS_ALLOW_ALL_ORIGINS=${CORS_ALLOW_ALL_ORIGINS:-True}
     volumes:
-      - .:/app
       - backend_staticfiles:/app/staticfiles
       - backend_mediafiles:/app/media
+      - backend_data:/app/persistent_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
   backend_staticfiles:
   backend_mediafiles:
+  backend_data:
 

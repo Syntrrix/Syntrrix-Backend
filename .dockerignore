@@ -28,3 +28,6 @@ staticfiles/
 *.log
 nohup.out
 gunicorn.log
+.idea/
+.vscode/
+*.sqlite3

@@ -5,8 +5,11 @@ echo "========================================="
 echo " Starting AgroBridge Backend Container "
 echo "========================================="
 
+# Ensure runtime directories exist
+mkdir -p /app/staticfiles /app/media /app/persistent_data
+
 # Determine MySQL database connection parameters
-DB_HOST=${DB_HOST:-syntrrix-db.cru0g2ggwfsb.ap-south-1.rds.amazonaws.com}
+DB_HOST=${DB_HOST:-127.0.0.1}
 DB_PORT=${DB_PORT:-3306}
 
 echo "Checking connection to MySQL database at ${DB_HOST}:${DB_PORT}..."
