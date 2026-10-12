@@ -1084,7 +1084,7 @@ class WhatsAppTemplate(models.Model):
     format = models.CharField(max_length=30, default="text")  # text, image, video, document, location, carousel
     header_text = models.TextField(blank=True, default="")
     header_media = models.FileField(upload_to='whatsapp_template_headers/', null=True, blank=True)
-    header_handle = models.CharField(max_length=255, blank=True, default="")
+    header_handle = models.TextField(blank=True, default="")
     body = models.TextField(blank=True, default="")
     footer = models.TextField(blank=True, default="")
     body_params = models.JSONField(default=dict, blank=True)
@@ -1127,6 +1127,8 @@ class WhatsAppCampaign(models.Model):
     read = models.CharField(max_length=50, default="0")
     failed = models.CharField(max_length=50, default="0")
     author = models.CharField(max_length=100, default="By you")
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+    scheduled_payload = models.JSONField(null=True, blank=True, default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1135,6 +1137,7 @@ class WhatsAppCampaign(models.Model):
         indexes = [
             models.Index(fields=["seller_user"]),
             models.Index(fields=["status"]),
+            models.Index(fields=["scheduled_at"]),
             models.Index(fields=["created_at"]),
         ]
 

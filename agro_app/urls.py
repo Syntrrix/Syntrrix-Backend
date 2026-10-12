@@ -66,6 +66,7 @@ from .views import (
     WhatsAppBulkTemplateAPIView,
     WhatsAppTemplateAPIView,
     WhatsAppTemplateSyncAPIView,
+    WhatsAppMediaUploadAPIView,
     WhatsAppCampaignAPIView,
     WhatsAppCampaignRecipientsAPIView,
 )
@@ -161,6 +162,7 @@ urlpatterns = [
     path("whatsapp/bulk-template/", WhatsAppBulkTemplateAPIView.as_view(), name="whatsapp-bulk-template"),
     path("whatsapp/templates/", WhatsAppTemplateAPIView.as_view(), name="whatsapp-templates"),
     path("whatsapp/templates/sync/", WhatsAppTemplateSyncAPIView.as_view(), name="whatsapp-templates-sync"),
+    path("whatsapp/media-upload/", WhatsAppMediaUploadAPIView.as_view(), name="whatsapp-media-upload"),
     path("whatsapp/campaigns/", WhatsAppCampaignAPIView.as_view(), name="whatsapp-campaigns"),
     path("whatsapp/campaigns/recipients/", WhatsAppCampaignRecipientsAPIView.as_view(), name="whatsapp-campaign-recipients"),
     path("whatsapp/webhook/", WhatsAppWebhookAPIView.as_view(), name="whatsapp-webhook"),

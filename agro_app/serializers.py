@@ -225,14 +225,17 @@ class UserDetailSerializer(serializers.ModelSerializer):
         }
 
     def get_plan(self, obj):
-        if not obj.plan:
+        try:
+            if not getattr(obj, "plan", None):
+                return None
+            return {
+                "plan_id": obj.plan.plan_id,
+                "name": obj.plan.name,
+                "features": obj.plan.features,
+                "description": obj.plan.description,
+            }
+        except Exception:
             return None
-        return {
-            "plan_id": obj.plan.plan_id,
-            "name": obj.plan.name,
-            "features": obj.plan.features,
-            "description": obj.plan.description,
-        }
 
     def get_whatsapp_configs(self, obj):
         try:

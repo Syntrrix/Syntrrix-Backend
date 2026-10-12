@@ -6,6 +6,7 @@ import mimetypes
 import os
 import random
 import uuid
+import threading
 from datetime import timedelta
 import json
 import re
@@ -154,7 +155,11 @@ def _extract_agent_assign_config(bot, node_id=None):
         auto_sequence_raw = (
             data.get("auto_sequence")
             if data.get("auto_sequence") is not None
-            else data.get("sequence_assign")
+            else (
+                data.get("sequence_assign")
+                if data.get("sequence_assign") is not None
+                else data.get("round_robin")
+            )
         )
         return {
             "enabled": True,
@@ -196,78 +201,61 @@ def _resolve_agent_assignment(bot, node_id=None):
     selected_agent_id = cfg.get("agent_user_id")
     auto_sequence = cfg.get("auto_sequence", True)
 
-    # Load full pools first, then apply selected IDs only if those IDs are valid.
     team_managers_all = list(team_managers_qs)
     agents_all = list(agents_qs)
     valid_tm_ids = {tm.user_id for tm in team_managers_all}
     valid_agent_ids = {ag.user_id for ag in agents_all}
 
-    team_managers = (
-        [tm for tm in team_managers_all if tm.user_id == selected_tm_id]
-        if selected_tm_id and selected_tm_id in valid_tm_ids
-        else team_managers_all
-    )
-    agents = (
-        [ag for ag in agents_all if ag.user_id == selected_agent_id]
-        if selected_agent_id and selected_agent_id in valid_agent_ids
-        else agents_all
-    )
-
+    # Resolve team manager
     chosen_tm = None
-    chosen_agent = None
+    if selected_tm_id and selected_tm_id in valid_tm_ids:
+        chosen_tm = next((tm for tm in team_managers_all if tm.user_id == selected_tm_id), None)
 
-    if selected_agent_id and selected_agent_id in valid_agent_ids and agents:
-        chosen_agent = agents[0]
-        if chosen_agent.parent_team_manager_id:
-            chosen_tm = next((tm for tm in team_managers if tm.user_id == chosen_agent.parent_team_manager_id), None)
-            if not chosen_tm:
-                try:
-                    chosen_tm = TeamMember.objects.get(
-                        seller_user=seller,
-                        member_type=TeamMember.MEMBER_TYPE_TEAM_MANAGER,
-                        user_id=chosen_agent.parent_team_manager_id,
-                    )
-                except TeamMember.DoesNotExist:
-                    chosen_tm = None
-
-    if not chosen_tm and team_managers:
-        if auto_sequence:
-            idx = bot.assignment_team_cursor % len(team_managers)
-            chosen_tm = team_managers[idx]
-            bot.assignment_team_cursor = bot.assignment_team_cursor + 1
-        else:
-            chosen_tm = random.choice(team_managers)
-
-    filtered_agents = agents
+    # Filter available agents under selected team manager if specified
+    filtered_agents = agents_all
     if chosen_tm:
-        scoped = [a for a in agents if a.parent_team_manager_id == chosen_tm.user_id]
-        filtered_agents = scoped if scoped else agents
-    # Stable order for round-robin (first agent in list = first in rotation).
+        scoped = [a for a in agents_all if a.parent_team_manager_id == chosen_tm.user_id]
+        if scoped:
+            filtered_agents = scoped
+
+    # Sort agents stably by team_member_id for sequential Round Robin rotation
     filtered_agents = sorted(filtered_agents, key=lambda a: a.team_member_id)
 
-    if not chosen_agent and filtered_agents:
-        if auto_sequence:
+    chosen_agent = None
+
+    if auto_sequence and filtered_agents:
+        # Round-robin mode enabled: rotate sequentially (1st request -> agent 1, 2nd -> agent 2, 3rd -> agent 3, 4th -> agent 1...)
+        from django.db import transaction
+        try:
+            with transaction.atomic():
+                b_fresh = Bot.objects.select_for_update().get(pk=bot.bot_id)
+                cursor = b_fresh.assignment_agent_cursor
+                idx = cursor % len(filtered_agents)
+                chosen_agent = filtered_agents[idx]
+                b_fresh.assignment_agent_cursor = cursor + 1
+                b_fresh.save(update_fields=["assignment_agent_cursor"])
+                bot.assignment_agent_cursor = cursor + 1
+        except Exception:
             idx = bot.assignment_agent_cursor % len(filtered_agents)
             chosen_agent = filtered_agents[idx]
-            bot.assignment_agent_cursor = bot.assignment_agent_cursor + 1
-        else:
+            bot.assignment_agent_cursor += 1
+            try:
+                bot.save(update_fields=["assignment_agent_cursor"])
+            except Exception:
+                pass
+    else:
+        # Round-robin disabled: pick specific agent if specified, else random
+        if selected_agent_id and selected_agent_id in valid_agent_ids:
+            chosen_agent = next((ag for ag in agents_all if ag.user_id == selected_agent_id), None)
+        if not chosen_agent and filtered_agents:
             chosen_agent = random.choice(filtered_agents)
 
-    if auto_sequence:
-        bot.save(update_fields=["assignment_team_cursor", "assignment_agent_cursor"])
-
-    # Keep manager in sync with selected agent whenever agent has parent mapping.
-    if chosen_agent and chosen_agent.parent_team_manager_id and (
-        not chosen_tm or chosen_tm.user_id != chosen_agent.parent_team_manager_id
-    ):
-        try:
-            chosen_tm = TeamMember.objects.get(
-                seller_user=seller,
-                member_type=TeamMember.MEMBER_TYPE_TEAM_MANAGER,
-                user_id=chosen_agent.parent_team_manager_id,
-            )
-        except TeamMember.DoesNotExist:
-            pass
+    # Keep team manager in sync with chosen agent's parent team manager
+    if chosen_agent and chosen_agent.parent_team_manager_id:
+        if not chosen_tm or chosen_tm.user_id != chosen_agent.parent_team_manager_id:
+            parent_tm = next((tm for tm in team_managers_all if tm.user_id == chosen_agent.parent_team_manager_id), None)
+            if parent_tm:
+                chosen_tm = parent_tm
 
     return (chosen_tm.user if chosen_tm else None, chosen_agent.user if chosen_agent else None)
 
@@ -387,21 +375,48 @@ def _live_chat_store_dir() -> str:
 
 
 def _live_chat_session_file(session_id: int) -> str:
-    return os.path.join(_live_chat_store_dir(), f"{int(session_id)}.json")
+    sid = int(session_id)
+    from django.conf import settings
+    media_dir = os.path.join(settings.MEDIA_ROOT, "live_chat")
+    os.makedirs(media_dir, exist_ok=True)
+    return os.path.join(media_dir, f"{sid}.json")
 
 
 def _get_persisted_live_chat_messages(session_id: int):
-    file_path = _live_chat_session_file(session_id)
-    try:
-        if not os.path.exists(file_path):
-            return None
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
+    sid = int(session_id)
+    from django.conf import settings
+    candidate_paths = [
+        os.path.join(settings.MEDIA_ROOT, "live_chat", f"{sid}.json"),
+        os.path.join(_live_chat_store_dir(), f"{sid}.json"),
+    ]
+    json_msgs = None
+    target_found_path = None
+    for file_path in candidate_paths:
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    json_msgs = data
+                    target_found_path = file_path
+                    break
+        except Exception as ex:
+            logger.error(f"Error reading live chat JSON file {file_path}: {ex}")
+
+    if json_msgs is None:
         return None
-    except Exception:
-        return None
+
+    # Sync file to all candidate paths if missing in one of them
+    for file_path in candidate_paths:
+        if file_path != target_found_path and not os.path.exists(file_path):
+            try:
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(json_msgs, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    return json_msgs
 
 
 def _detect_bot_attachment_type(mime_type: str, file_name: str) -> str:
@@ -468,12 +483,124 @@ def _flow_message_to_chat_row(m, idx: int, base_time):
 
 
 def _set_persisted_live_chat_messages(session_id: int, messages):
-    file_path = _live_chat_session_file(session_id)
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    tmp_path = f"{file_path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(messages, f, ensure_ascii=False)
-    os.replace(tmp_path, file_path)
+    sid = int(session_id)
+    from django.conf import settings
+    candidate_paths = [
+        os.path.join(settings.MEDIA_ROOT, "live_chat", f"{sid}.json"),
+        os.path.join(_live_chat_store_dir(), f"{sid}.json"),
+    ]
+    for file_path in candidate_paths:
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            tmp_path = f"{file_path}.tmp_{uuid.uuid4().hex[:6]}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(messages, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, file_path)
+        except Exception as ex:
+            logger.error(f"Failed writing live chat JSON file {file_path}: {ex}")
+
+
+def _save_live_chat_message(session_or_id, sender_type: str, message_text: str, media_payload: dict = None):
+    """
+    Writes a chat message exclusively into the JSON session file store inside media/live_chat/<session_id>.json.
+    (No database insertions into LiveChatMessage table, as requested).
+    Accepts either a LiveChatSession instance or integer session_id.
+    """
+    from agro_app.models import LiveChatSession
+    try:
+        if isinstance(session_or_id, LiveChatSession):
+            session = session_or_id
+            sid = int(session.session_id)
+        else:
+            sid = int(session_or_id)
+            session = LiveChatSession.objects.get(session_id=sid)
+
+        msg_body = (message_text or "").strip()
+        if not msg_body and not media_payload:
+            return None
+
+        display_msg = msg_body or (f"Uploaded file: {media_payload.get('file_name')}" if media_payload else "Attachment")
+
+        cached = _get_persisted_live_chat_messages(sid) or []
+        new_row = {
+            "message_id": uuid.uuid4().hex,
+            "sender_type": sender_type,
+            "message": display_msg,
+            "created_at": timezone.now().isoformat(),
+        }
+        if media_payload:
+            new_row["file_url"] = media_payload.get("file_url")
+            new_row["file_name"] = media_payload.get("file_name")
+            new_row["mime_type"] = media_payload.get("mime_type")
+            new_row["attachment_type"] = _detect_bot_attachment_type(media_payload.get("mime_type"), media_payload.get("file_name"))
+
+        cached.append(new_row)
+        _set_persisted_live_chat_messages(sid, cached)
+
+        try:
+            vp = dict(session.visitor_payload or {})
+            st_clean = str(sender_type).strip().lower()
+            if st_clean in ("customer", "user", "visitor"):
+                vp["is_read"] = False
+            elif st_clean == "seller":
+                vp["is_read"] = True
+                vp["last_read_message_id"] = str(new_row.get("message_id") or "")
+                vp["seller_last_read_at"] = timezone.now().isoformat()
+            session.visitor_payload = vp
+            session.save(update_fields=["visitor_payload", "updated_at"])
+        except Exception:
+            pass
+
+        return new_row
+    except Exception as ex:
+        logger.error(f"Failed in _save_live_chat_message for session {session_or_id}: {ex}")
+        return None
+
+
+def _get_or_create_live_chat_session_for_whatsapp(seller_user, customer_phone: str, customer_name: str = ""):
+    """
+    Gets or creates a Customer and LiveChatSession for WhatsApp phone number.
+    Ensures that sent template messages or incoming WhatsApp messages create the live chat room properly.
+    """
+    from agro_app.models import LiveChatSession, Customer, Bot
+    phone = str(customer_phone or "").strip()
+    if not phone:
+        return None, False
+
+    customer = Customer.objects.filter(seller_user=seller_user, mobile_number=phone).first()
+    if not customer:
+        customer = Customer.objects.filter(seller_user=seller_user, whatsapp_number=phone).first()
+
+    if not customer:
+        c_name = customer_name or f"WA Customer {phone[-4:]}"
+        bot = Bot.objects.filter(seller_user=seller_user, is_published=True).first()
+        customer = Customer.objects.create(
+            seller_user=seller_user,
+            full_name=c_name,
+            mobile_number=phone,
+            whatsapp_number=phone,
+            created_via_bot=True,
+            source_bot=bot
+        )
+    elif customer_name and (not customer.full_name or customer.full_name.startswith("WA Customer")):
+        customer.full_name = customer_name
+        customer.save(update_fields=["full_name"])
+
+    session = LiveChatSession.objects.filter(seller_user=seller_user, customer=customer).first()
+    created = False
+    if not session:
+        bot = Bot.objects.filter(seller_user=seller_user, is_published=True).first()
+        session = LiveChatSession.objects.create(
+            seller_user=seller_user,
+            customer=customer,
+            source_bot=bot,
+            visitor_name=customer.full_name or customer_name,
+            visitor_mobile_number=phone,
+            lead_pipeline_status="New Leads",
+            visitor_payload={"lead_source": "WhatsApp Campaign/Template"}
+        )
+        created = True
+    return session, created
 
 
 def _clear_live_chat_session_storage(session_id: int) -> None:
@@ -512,10 +639,23 @@ def _data_hub_table_rows_file(seller_user_id: int, table_id: str) -> str:
 def _read_json_file(path: str, default):
     try:
         if not os.path.exists(path):
-            return default
+            # Check legacy paths and auto-migrate
+            old_candidates = [
+                path.replace(os.path.join("media", "data_hub"), os.path.join("persistent_data", "data_hub")),
+                path.replace(os.path.join("media", "data_hub"), os.path.join("/var/tmp/agrobridge_data", "data_hub")),
+            ]
+            for old_p in old_candidates:
+                if os.path.exists(old_p):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    shutil.copy2(old_p, path)
+                    logger.info(f"DataHub: Auto-migrated JSON file from {old_p} to {path}")
+                    break
+            else:
+                return default
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as ex:
+        logger.error(f"Failed reading JSON file {path}: {ex}")
         return default
 
 
@@ -926,27 +1066,6 @@ class DataHubTableRowsAPIView(APIView):
         rows = payload.get("rows") if isinstance(payload, dict) else []
         if not isinstance(rows, list):
             rows = []
-
-        try:
-            with open(rows_path, "r", encoding="utf-8") as f:
-                temp_data = json.load(f)
-            rows_count_debug = len(temp_data.get("rows", []))
-            err_msg = "No Error"
-        except Exception as ex:
-            import traceback
-            rows_count_debug = -1
-            err_msg = traceback.format_exc()
-
-        try:
-            with open("d:\\Agrobridge\\agro\\agro\\agrobridge\\debug_rows.txt", "w", encoding="utf-8") as f_debug:
-                f_debug.write(f"JSON Load Debug Count: {rows_count_debug}\n")
-                f_debug.write(f"Error Message: {err_msg}\n")
-                if rows_count_debug != -1:
-                    for r in temp_data.get("rows", []):
-                        if isinstance(r, dict):
-                            f_debug.write(f"Row ID: {r.get('row_id')}, Manager ID: {r.get('assigned_team_manager_id')}, Agent ID: {r.get('assigned_agent_id')}\n")
-        except Exception as ex:
-            pass
 
         role_id = request.user.role.role_id
         if role_id == UserRole.ROLE_SELLER:
@@ -1822,10 +1941,11 @@ class LoginAPIView(APIView):
             )
         except Exception as exc:  # pragma: no cover - safeguard
             logger.exception("Unexpected error during login")
+            err_msg = str(exc) if getattr(settings, "DEBUG", False) else "Unexpected error occurred. Please try again later."
             return Response(
                 {
                     "success": False,
-                    "message": "Unexpected error occurred. Please try again later.",
+                    "message": err_msg,
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
@@ -2397,22 +2517,46 @@ class LiveChatMessagesAPIView(APIView):
 
         try:
             session = self._get_session_for_user(request, session_id)
-            persisted = _get_persisted_live_chat_messages(int(session_id))
-            if persisted:
-                return Response(
-                    {"success": True, "data": persisted[-limit:]},
-                    status=status.HTTP_200_OK,
-                )
+            persisted = _get_persisted_live_chat_messages(int(session_id)) or []
 
-            messages_qs = session.messages.order_by("created_at").all()[:limit]
+            from django.utils import timezone
+            now_iso = timezone.now().isoformat()
+            last_msg_id = str(persisted[-1].get("message_id") or "") if persisted else ""
+
+            # Find all sessions belonging to the same customer under this seller to clear unread counts consistently
+            c_phone = session.customer.mobile_number if session.customer else session.visitor_mobile_number
+            c_email = session.customer.email if session.customer else session.visitor_email
+            phone_clean = "".join(c for c in str(c_phone or "") if c.isdigit())
+            email_clean = str(c_email or "").strip().lower()
+
+            related = LiveChatSession.objects.filter(seller_user=session.seller_user)
+            if session.customer_id:
+                related = related.filter(Q(customer_id=session.customer_id) | Q(session_id=session.session_id))
+            elif phone_clean and len(phone_clean) >= 10:
+                related = related.filter(Q(visitor_mobile_number__contains=phone_clean[-10:]) | Q(session_id=session.session_id))
+            elif email_clean:
+                related = related.filter(Q(visitor_email__iexact=email_clean) | Q(session_id=session.session_id))
+            else:
+                related = related.filter(session_id=session.session_id)
+
+            for rs in related:
+                vp = dict(rs.visitor_payload or {})
+                vp["seller_last_read_at"] = now_iso
+                vp["is_read"] = True
+                if last_msg_id:
+                    vp["last_read_message_id"] = last_msg_id
+                rs.visitor_payload = vp
+                rs.save(update_fields=["visitor_payload", "updated_at"])
+
+            return Response(
+                {"success": True, "data": persisted[-limit:]},
+                status=status.HTTP_200_OK,
+            )
         except LiveChatSession.DoesNotExist:
             return Response(
                 {"success": False, "message": "Session not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-
-        serializer = LiveChatMessageSerializer(messages_qs, many=True)
-        return Response({"success": True, "data": serializer.data}, status=status.HTTP_200_OK)
 
     def post(self, request):
         if request.user.role.role_id not in [UserRole.ROLE_SELLER, UserRole.ROLE_TEAM_MANAGER, UserRole.ROLE_AGENT]:
@@ -2421,7 +2565,7 @@ class LiveChatMessagesAPIView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        session_id = request.query_params.get("session_id")
+        session_id = request.query_params.get("session_id") or request.data.get("session_id")
         if not session_id:
             return Response(
                 {"success": False, "message": "session_id is required."},
@@ -2429,40 +2573,68 @@ class LiveChatMessagesAPIView(APIView):
             )
 
         message_text = (request.data.get("message") or "").strip()
-        if not message_text:
+        uploaded_file = request.FILES.get("file") or request.FILES.get("media") or request.FILES.get("attachment")
+
+        if not message_text and not uploaded_file:
             return Response(
-                {"success": False, "message": "message is required."},
+                {"success": False, "message": "message or file is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        media_payload = None
+        if uploaded_file:
+            import os, uuid
+            from django.core.files.storage import default_storage
+            from django.core.files.base import ContentFile
+
+            original_name = getattr(uploaded_file, "name", "file") or "file"
+            mime_type = (getattr(uploaded_file, "content_type", "") or "").lower()
+            ext = os.path.splitext(original_name)[1].lower()
+            safe_name = f"{uuid.uuid4().hex[:10]}_{original_name.replace(' ', '_')}"
+
+            rel_dir = f"live_chat_uploads/{session_id}"
+            saved_path = default_storage.save(f"{rel_dir}/{safe_name}", ContentFile(uploaded_file.read()))
+            media_url = f"/media/{saved_path}"
+
+            media_payload = {
+                "file_url": media_url,
+                "file_name": original_name,
+                "mime_type": mime_type or ("image/jpeg" if ext in ['.jpg', '.jpeg', '.png', '.webp'] else "application/pdf"),
+            }
+
         try:
             session = self._get_session_for_user(request, session_id)
-            sid = int(session_id)
-            cached = _get_persisted_live_chat_messages(sid)
-            if not cached:
-                # Backfill from DB for older sessions that may have data persisted already.
-                db_msgs = session.messages.order_by("created_at").all()[:200]
-                cached = []
-                for m in db_msgs:
-                    cached.append(
-                        {
-                            "message_id": m.message_id,
-                            "sender_type": m.sender_type,
-                            "message": m.message,
-                            "created_at": m.created_at.isoformat() if m.created_at else None,
-                        }
-                    )
+            new_msg = _save_live_chat_message(session, LiveChatMessage.SENDER_SELLER, message_text, media_payload=media_payload)
 
-            new_msg = {
-                "message_id": uuid.uuid4().hex,
-                "sender_type": LiveChatMessage.SENDER_SELLER,
-                "message": message_text,
-                "created_at": timezone.now().isoformat(),
-            }
-            cached.append(new_msg)
-            _set_persisted_live_chat_messages(sid, cached)
+            from django.utils import timezone
+            now_iso = timezone.now().isoformat()
+            new_msg_id = str(new_msg.get("message_id")) if new_msg and isinstance(new_msg, dict) and new_msg.get("message_id") else ""
 
-            # If the session is linked to a WhatsApp customer, send the agent reply back to customer WhatsApp handset!
+            c_phone = session.customer.mobile_number if session.customer else session.visitor_mobile_number
+            c_email = session.customer.email if session.customer else session.visitor_email
+            phone_clean = "".join(c for c in str(c_phone or "") if c.isdigit())
+            email_clean = str(c_email or "").strip().lower()
+
+            related = LiveChatSession.objects.filter(seller_user=session.seller_user)
+            if session.customer_id:
+                related = related.filter(Q(customer_id=session.customer_id) | Q(session_id=session.session_id))
+            elif phone_clean and len(phone_clean) >= 10:
+                related = related.filter(Q(visitor_mobile_number__contains=phone_clean[-10:]) | Q(session_id=session.session_id))
+            elif email_clean:
+                related = related.filter(Q(visitor_email__iexact=email_clean) | Q(session_id=session.session_id))
+            else:
+                related = related.filter(session_id=session.session_id)
+
+            for rs in related:
+                vp = dict(rs.visitor_payload or {})
+                vp["seller_last_read_at"] = now_iso
+                vp["is_read"] = True
+                if new_msg_id:
+                    vp["last_read_message_id"] = new_msg_id
+                rs.visitor_payload = vp
+                rs.save(update_fields=["visitor_payload", "updated_at"])
+
+            # If the session is linked to a WhatsApp customer, send the agent reply/media back to customer WhatsApp handset!
             try:
                 from agro_app.models import WhatsAppChatSession, WhatsAppConfig
                 wa_session = WhatsAppChatSession.objects.filter(live_chat_session=session).order_by("-updated_at").first()
@@ -2477,19 +2649,67 @@ class LiveChatMessagesAPIView(APIView):
                 if customer_phone:
                     config = WhatsAppConfig.objects.filter(seller_user=session.seller_user, is_connected=True).order_by("-updated_at").first()
                     if config and config.is_connected:
-                        payload = {
-                            "type": "text",
-                            "text": {"preview_url": False, "body": message_text}
-                        }
+                        domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
+                        scheme = "https" if (request.is_secure() or "api.qa.syntrrix.com" in domain) else "http"
+
+                        if media_payload and media_payload.get("file_url"):
+                            raw_link = media_payload["file_url"]
+                            full_link = f"{scheme}://{domain}{raw_link}" if not raw_link.startswith("http") else raw_link
+                            sanitized_link = _sanitize_meta_media_url(full_link, domain)
+
+                            mime = (media_payload.get("mime_type") or "").lower()
+                            fname = media_payload.get("file_name") or "file"
+                            ext = os.path.splitext(fname)[1].lower()
+
+                            if mime.startswith("image/") or ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                                payload = {
+                                    "type": "image",
+                                    "image": {
+                                        "link": sanitized_link
+                                    }
+                                }
+                                if message_text:
+                                    payload["image"]["caption"] = message_text
+                            elif mime.startswith("video/") or ext in [".mp4", ".mov", ".avi", ".webm", ".3gp"]:
+                                payload = {
+                                    "type": "video",
+                                    "video": {
+                                        "link": sanitized_link
+                                    }
+                                }
+                                if message_text:
+                                    payload["video"]["caption"] = message_text
+                            else:
+                                # PDF / Document
+                                payload = {
+                                    "type": "document",
+                                    "document": {
+                                        "link": sanitized_link,
+                                        "filename": fname
+                                    }
+                                }
+                                if message_text:
+                                    payload["document"]["caption"] = message_text
+                        else:
+                            payload = {
+                                "type": "text",
+                                "text": {"preview_url": False, "body": message_text}
+                            }
+
                         ok, err_msg = _send_whatsapp_message_raw(config, customer_phone, payload)
                         if not ok:
-                            logger.error(f"Failed to send LiveChat reply to WhatsApp {customer_phone}: {err_msg}")
+                            logger.error(f"Failed to send LiveChat reply/media to WhatsApp {customer_phone}: {err_msg}")
                         else:
-                            logger.info(f"LiveChat reply sent to WhatsApp {customer_phone} successfully via channel '{config.channel_name}'")
+                            logger.info(f"LiveChat reply/media sent to WhatsApp {customer_phone} successfully via channel '{config.channel_name}'")
                     else:
                         logger.warning(f"LiveChat reply to WhatsApp skipped: No active connected WhatsAppConfig for seller '{session.seller_user.email}'")
             except Exception as wa_ex:
                 logger.error(f"Failed to forward LiveChat message to WhatsApp: {wa_ex}")
+
+            return Response(
+                {"success": True, "data": new_msg},
+                status=status.HTTP_200_OK,
+            )
 
         except LiveChatSession.DoesNotExist:
             return Response(
@@ -2845,7 +3065,60 @@ def _live_chat_support_session_row(s):
                 "message": last_msg.message,
                 "created_at": last_msg.created_at.isoformat() if last_msg.created_at else None,
             }
+
     vp = s.visitor_payload or {}
+    is_read_flag = bool(vp.get("is_read", False))
+    last_read_msg_id = str(vp.get("last_read_message_id") or "")
+    seller_last_read_at_str = vp.get("seller_last_read_at")
+    seller_last_read_dt = None
+    if seller_last_read_at_str:
+        try:
+            from django.utils.dateparse import parse_datetime
+            seller_last_read_dt = parse_datetime(str(seller_last_read_at_str))
+        except Exception:
+            seller_last_read_dt = None
+
+    unread_count = 0
+    if persisted:
+        last_sender = str(persisted[-1].get("sender_type") or "").strip().lower()
+        if last_sender == "seller":
+            unread_count = 0
+        elif is_read_flag:
+            if last_read_msg_id:
+                new_count = 0
+                for m in reversed(persisted):
+                    m_id_str = str(m.get("message_id") or "")
+                    if m_id_str == last_read_msg_id:
+                        break
+                    st = str(m.get("sender_type") or "").strip().lower()
+                    if st in ("customer", "user", "visitor"):
+                        new_count += 1
+                unread_count = new_count
+            else:
+                unread_count = 0
+        else:
+            for m in reversed(persisted):
+                st = str(m.get("sender_type") or "").strip().lower()
+                if st == "seller":
+                    break
+                if st in ("customer", "user", "visitor"):
+                    m_dt_str = m.get("created_at")
+                    if seller_last_read_dt and m_dt_str:
+                        try:
+                            from django.utils.dateparse import parse_datetime
+                            m_dt = parse_datetime(str(m_dt_str))
+                            if m_dt and m_dt <= seller_last_read_dt:
+                                break
+                        except Exception:
+                            pass
+                    unread_count += 1
+    else:
+        last_sender = str(last.get("sender_type") if last else "").strip().lower()
+        if last_sender == "seller" or is_read_flag:
+            unread_count = 0
+        else:
+            unread_count = 1 if last else 0
+
     mgr_name = (s.assigned_team_manager.full_name if s.assigned_team_manager else str(vp.get("manual_team_name") or "").strip())
     agent_name = (s.assigned_agent.full_name if s.assigned_agent else str(vp.get("manual_agent_name") or "").strip())
     return {
@@ -2860,6 +3133,8 @@ def _live_chat_support_session_row(s):
         "last_message_text": last.get("message") if last else "",
         "last_message_created_at": last.get("created_at") if last else None,
         "last_message_sender_type": last.get("sender_type") if last else "customer",
+        "unread_count": unread_count,
+        "is_read": is_read_flag if unread_count == 0 else False,
         "assigned_team_manager_id": s.assigned_team_manager_id,
         "assigned_team_manager_name": mgr_name or "",
         "assigned_agent_id": s.assigned_agent_id,
@@ -2869,6 +3144,7 @@ def _live_chat_support_session_row(s):
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
         "is_manual_pipeline_lead": bool(getattr(s, "is_manual_pipeline_lead", False)),
     }
+
 
 
 def _apply_session_assignment_from_names(session, team_manager_name: str, agent_name: str):
@@ -8494,10 +8770,18 @@ def _get_next_node_id(edges, source_id, label=None, source_handle=None):
                 return e.get("target")
     if label:
         lbl = str(label).lower()
+        # 1. Match sourceHandle directly with label (e.g. 'yes', 'no', 'success', 'fallback')
+        for e in out:
+            if str(e.get("sourceHandle") or "").lower() == lbl:
+                return e.get("target")
+        # 2. Match label
         for e in out:
             edge_lbl = str(e.get("label") or "").lower()
-            if edge_lbl == lbl or (lbl == "yes" and edge_lbl == ""):
+            if edge_lbl == lbl or (lbl == "yes" and edge_lbl == "") or (lbl == "yes" and not any(str(e2.get("label") or "").lower() == "no" for e2 in out)):
                 return e.get("target")
+        if lbl == "no" and len(out) > 1:
+            no_edge = next((e for e in out if str(e.get("label") or "").lower() == "no"), out[1])
+            return no_edge.get("target")
 
     # default plain edge (no sourceHandle/label)
     plain = [e for e in out if not str(e.get("sourceHandle") or "").strip() and not str(e.get("label") or "").strip()]
@@ -8527,6 +8811,29 @@ def _render_text_with_vars(text, collected_data):
     # Normalize fullwidth @
     normalized = text_str.replace("\uFF03", "@")
     return re.sub(r"@\s*([a-zA-Z0-9_]+)", replace_var, normalized)
+
+
+def _sanitize_meta_media_url(raw_url, domain="api.qa.syntrrix.com"):
+    if not raw_url:
+        return ""
+    url_str = str(raw_url).strip()
+    if not url_str or url_str.lower().startswith("blob:"):
+        return ""
+
+    public_domain = "api.qa.syntrrix.com"
+
+    if url_str.startswith("/"):
+        return f"https://{public_domain}{url_str}"
+
+    if any(local_host in url_str.lower() for local_host in ["127.0.0.1", "localhost", "0.0.0.0", "192.168.", "10.0.", "172.16."]):
+        import re
+        url_str = re.sub(r'http://(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\d+\.\d+\.\d+\.\d+)(?::\d+)?', f'https://{public_domain}', url_str)
+        url_str = re.sub(r'https://(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\d+\.\d+\.\d+\.\d+)(?::\d+)?', f'https://{public_domain}', url_str)
+
+    if url_str.startswith("http://"):
+        url_str = url_str.replace("http://", "https://")
+
+    return url_str
 
 
 def _send_whatsapp_message_raw(config, recipient, payload):
@@ -8600,11 +8907,8 @@ def _send_whatsapp_text(session, text, config=None):
     if not config:
         from agro_app.models import WhatsAppConfig
         config = WhatsAppConfig.objects.filter(seller_user=session.seller_user, is_connected=True).first()
-    if not config:
-        logger.warning(f"WhatsApp Bot Runner: No WhatsAppConfig found for seller '{session.seller_user.email}' inside _send_whatsapp_text")
-        return False
-    if not config.is_connected:
-        logger.warning(f"WhatsApp Bot Runner: WhatsAppConfig is NOT connected for seller '{session.seller_user.email}' inside _send_whatsapp_text")
+    if not config or not config.is_connected:
+        logger.warning(f"WhatsApp Bot Runner: No active WhatsAppConfig found for seller '{session.seller_user.email}' inside _send_whatsapp_text")
         return False
     payload = {
         "type": "text",
@@ -8614,20 +8918,8 @@ def _send_whatsapp_text(session, text, config=None):
     if not ok:
         logger.error(f"WhatsApp Bot Runner: Failed to send text to {session.customer_phone}. Error: {err_msg}")
     else:
-        # Save sent bot text message into Live Chat transcript for support panel
         if session and session.live_chat_session:
-            try:
-                sid = int(session.live_chat_session.session_id)
-                cached = _get_persisted_live_chat_messages(sid) or []
-                cached.append({
-                    "message_id": uuid.uuid4().hex,
-                    "sender_type": LiveChatMessage.SENDER_SELLER,
-                    "message": str(text),
-                    "created_at": timezone.now().isoformat(),
-                })
-                _set_persisted_live_chat_messages(sid, cached)
-            except Exception as ex:
-                logger.error(f"Failed to append bot message to transcript: {ex}")
+            _save_live_chat_message(session.live_chat_session, LiveChatMessage.SENDER_SELLER, str(text))
     return ok
 
 
@@ -8635,22 +8927,22 @@ def _send_whatsapp_interactive_buttons(session, text, buttons, config=None):
     if not config:
         from agro_app.models import WhatsAppConfig
         config = WhatsAppConfig.objects.filter(seller_user=session.seller_user, is_connected=True).first()
-    if not config:
-        logger.warning(f"WhatsApp Bot Runner: No WhatsAppConfig found for seller '{session.seller_user.email}' inside _send_whatsapp_interactive_buttons")
-        return False
-    if not config.is_connected:
-        logger.warning(f"WhatsApp Bot Runner: WhatsAppConfig is NOT connected for seller '{session.seller_user.email}' inside _send_whatsapp_interactive_buttons")
+    if not config or not config.is_connected:
+        logger.warning(f"WhatsApp Bot Runner: No active WhatsAppConfig found for seller '{session.seller_user.email}' inside _send_whatsapp_interactive_buttons")
         return False
 
     whatsapp_buttons = []
+    btn_titles = []
     for btn in buttons[:3]:
+        b_title = str(btn.get("title"))[:20]
         whatsapp_buttons.append({
             "type": "reply",
             "reply": {
                 "id": str(btn.get("id"))[:256],
-                "title": str(btn.get("title"))[:20]
+                "title": b_title
             }
         })
+        btn_titles.append(f"• {b_title}")
 
     payload = {
         "type": "interactive",
@@ -8665,6 +8957,12 @@ def _send_whatsapp_interactive_buttons(session, text, buttons, config=None):
     ok, err_msg = _send_whatsapp_message_raw(config, session.customer_phone, payload)
     if not ok:
         logger.error(f"WhatsApp Bot Runner: Failed to send interactive buttons to {session.customer_phone}. Error: {err_msg}")
+    else:
+        if session and session.live_chat_session:
+            display_msg = f"[Bot Question]: {text}"
+            if btn_titles:
+                display_msg += "\n\nOptions:\n" + "\n".join(btn_titles)
+            _save_live_chat_message(session.live_chat_session, LiveChatMessage.SENDER_SELLER, display_msg)
     return ok
 
 
@@ -8676,12 +8974,16 @@ def _send_whatsapp_interactive_list(session, text, button_label, rows, config=No
         return False
 
     list_rows = []
-    for r in rows[:10]:
+    row_titles = []
+    for i, r in enumerate(rows[:10]):
+        title = str(r.get("title"))[:24]
+        desc = str(r.get("description") or "")[:72]
         list_rows.append({
             "id": str(r.get("id"))[:200],
-            "title": str(r.get("title"))[:24],
-            "description": str(r.get("description") or "")[:72]
+            "title": title,
+            "description": desc
         })
+        row_titles.append(f"{i+1}. {title}" + (f" ({desc})" if desc else ""))
 
     payload = {
         "type": "interactive",
@@ -8700,6 +9002,11 @@ def _send_whatsapp_interactive_list(session, text, button_label, rows, config=No
         }
     }
     ok, _ = _send_whatsapp_message_raw(config, session.customer_phone, payload)
+    if ok and session and session.live_chat_session:
+        display_msg = f"[Bot Question]: {text}"
+        if row_titles:
+            display_msg += "\n\nSelectable Options:\n" + "\n".join(row_titles)
+        _save_live_chat_message(session.live_chat_session, LiveChatMessage.SENDER_SELLER, display_msg)
     return ok
 
 
@@ -8752,35 +9059,34 @@ def _create_or_update_captured_customer(session, bot):
 def _persist_whatsapp_chat_transcript(chat_session, collected_data):
     try:
         sid = int(chat_session.session_id)
+        existing = _get_persisted_live_chat_messages(sid)
+        if existing:
+            # Real live chat messages are already preserved in real-time. Do not overwrite!
+            return
+
         chat_rows = []
-        base_time = timezone.now() - timedelta(minutes=10)
+        base_time = timezone.now() - timedelta(minutes=5)
         idx = 0
 
-        chat_rows.append({
-            "message_id": uuid.uuid4().hex,
-            "sender_type": LiveChatMessage.SENDER_CUSTOMER,
-            "message": "Started WhatsApp Interaction",
-            "created_at": base_time.isoformat(),
-        })
-
-        for k, v in collected_data.items():
-            if k in ["name", "full_name", "phone", "email", "address", "data_storage_requirement", "custom_input"]:
+        for k, v in (collected_data or {}).items():
+            if k in ["name", "full_name", "phone", "email", "address", "data_storage_requirement", "custom_input"] and v:
                 idx += 1
                 chat_rows.append({
                     "message_id": uuid.uuid4().hex,
                     "sender_type": LiveChatMessage.SENDER_SELLER,
                     "message": f"Collected {k}:",
-                    "created_at": (base_time + timedelta(seconds=idx * 10)).isoformat(),
+                    "created_at": (base_time + timedelta(seconds=idx * 5)).isoformat(),
                 })
                 idx += 1
                 chat_rows.append({
                     "message_id": uuid.uuid4().hex,
                     "sender_type": LiveChatMessage.SENDER_CUSTOMER,
                     "message": str(v),
-                    "created_at": (base_time + timedelta(seconds=idx * 10)).isoformat(),
+                    "created_at": (base_time + timedelta(seconds=idx * 5)).isoformat(),
                 })
 
-        _set_persisted_live_chat_messages(sid, chat_rows)
+        if chat_rows:
+            _set_persisted_live_chat_messages(sid, chat_rows)
     except Exception as ex:
         logger.error(f"Error persisting WA transcript: {ex}")
 
@@ -8951,18 +9257,28 @@ def _run_whatsapp_bot(session, msg_text=None, incoming_media_payload=None, confi
 
         logger.info(f"WhatsApp Bot Runner: Loaded bot flow. Nodes: {list(nodes.keys())}. Edges: {edges}")
 
+        # Allow customer to restart flow anytime by typing reset/start
+        if msg_text and str(msg_text).strip().lower() in ["start", "restart", "reset", "/start"]:
+            session.current_node_id = "start"
+            session.collected_data = {}
+            session.is_submitted = False
+            session.save()
+
+        is_start_session = False
         # Resolve 'start' current_node_id to the actual root node of the flow
-        if session.current_node_id == "start" and "start" not in nodes:
-            targets = {e.get("target") for e in edges if e.get("target")}
-            candidates = [nid for nid in nodes.keys() if nid not in targets]
-            if candidates:
-                start_cand = next((c for c in candidates if "start" in c.lower()), candidates[0])
-                session.current_node_id = start_cand
-                logger.info(f"WhatsApp Bot Runner: Resolved 'start' node ID to flow root node '{start_cand}'")
-            elif nodes:
-                first_node = list(nodes.keys())[0]
-                session.current_node_id = first_node
-                logger.info(f"WhatsApp Bot Runner: No root node found, fallback to first node '{first_node}'")
+        if session.current_node_id == "start":
+            is_start_session = True
+            if "start" not in nodes:
+                targets = {e.get("target") for e in edges if e.get("target")}
+                candidates = [nid for nid in nodes.keys() if nid not in targets]
+                if candidates:
+                    start_cand = next((c for c in candidates if "start" in c.lower()), candidates[0])
+                    session.current_node_id = start_cand
+                    logger.info(f"WhatsApp Bot Runner: Resolved 'start' node ID to flow root node '{start_cand}'")
+                elif nodes:
+                    first_node = list(nodes.keys())[0]
+                    session.current_node_id = first_node
+                    logger.info(f"WhatsApp Bot Runner: No root node found, fallback to first node '{first_node}'")
 
         logger.info(f"WhatsApp Bot Runner: Resuming bot execution loop for customer {session.customer_phone} from node '{session.current_node_id}' with text '{msg_text}'")
 
@@ -8993,18 +9309,12 @@ def _run_whatsapp_bot(session, msg_text=None, incoming_media_payload=None, confi
 
         # Record incoming customer text into transcript for live chat support panel
         if msg_text and chat_session:
-            try:
-                sid = int(chat_session.session_id)
-                cached = _get_persisted_live_chat_messages(sid) or []
-                cached.append({
-                    "message_id": uuid.uuid4().hex,
-                    "sender_type": LiveChatMessage.SENDER_CUSTOMER,
-                    "message": str(msg_text),
-                    "created_at": timezone.now().isoformat(),
-                })
-                _set_persisted_live_chat_messages(sid, cached)
-            except Exception as ex:
-                logger.error(f"Failed to append customer message to transcript: {ex}")
+            _save_live_chat_message(chat_session, LiveChatMessage.SENDER_CUSTOMER, str(msg_text), incoming_media_payload)
+
+        # On initial bot session start/trigger, clear msg_text & incoming_media_payload so trigger text isn't consumed by 2nd/first question node
+        if is_start_session:
+            msg_text = None
+            incoming_media_payload = None
 
         while session.current_node_id:
             node = nodes.get(session.current_node_id)
@@ -9069,6 +9379,18 @@ def _run_whatsapp_bot(session, msg_text=None, incoming_media_payload=None, confi
 
                     session.collected_data[var_name] = val
 
+                    # Instant name mapping: when user enters name at name step/variable
+                    if kind == "name" or str(var_name).lower() in ["name", "full_name", "customer_name", "user_name"]:
+                        user_entered_name = str(val or "").strip()
+                        if user_entered_name:
+                            session.customer_name = user_entered_name
+                            if chat_session:
+                                chat_session.visitor_name = user_entered_name
+                                if chat_session.customer:
+                                    chat_session.customer.full_name = user_entered_name
+                                    chat_session.customer.save(update_fields=["full_name"])
+                                chat_session.save(update_fields=["visitor_name"])
+
                     next_node_id = None
                     if kind == "yes_no":
                         next_node_id = _get_next_node_id(edges, node["id"], label=val)
@@ -9114,10 +9436,13 @@ def _run_whatsapp_bot(session, msg_text=None, incoming_media_payload=None, confi
                         "lead_pipeline_status": "New Leads",
                     }
                 )
-                if not created and not chat_session.lead_pipeline_status:
+                chat_session.assigned_team_manager = assigned_team_manager
+                chat_session.assigned_agent = assigned_agent
+                if not chat_session.lead_pipeline_status:
                     chat_session.lead_pipeline_status = "New Leads"
-                    chat_session.save()
+                chat_session.save(update_fields=["assigned_team_manager", "assigned_agent", "lead_pipeline_status", "updated_at"])
                 session.live_chat_session = chat_session
+                _sync_session_assignment_to_data_hub(chat_session)
 
                 note = node.get("data", {}).get("label") or "You are being assigned to our support team."
                 _send_whatsapp_text(session, note, config=config)
@@ -9177,34 +9502,29 @@ def _process_whatsapp_customer_message(config, customer_phone, customer_name, ms
             seller_user=config.seller_user,
             customer__mobile_number=customer_phone
         ).first()
+        if not live_chat_session:
+            live_chat_session = LiveChatSession.objects.filter(
+                seller_user=config.seller_user,
+                customer__whatsapp_number=customer_phone
+            ).first()
+        if not live_chat_session:
+            live_chat_session = LiveChatSession.objects.filter(
+                seller_user=config.seller_user,
+                visitor_mobile_number=customer_phone
+            ).first()
 
         if live_chat_session:
             logger.info(f"WhatsApp Webhook: Customer {customer_phone} already has an active LiveChatSession (ID: {live_chat_session.session_id}) in support panel. Forwarding message to agent and ignoring bot flow.")
-            sid = int(live_chat_session.session_id)
-            cached = _get_persisted_live_chat_messages(sid) or []
-            new_msg = {
-                "message_id": uuid.uuid4().hex,
-                "sender_type": LiveChatMessage.SENDER_CUSTOMER,
-                "message": msg_text,
-                "created_at": timezone.now().isoformat(),
-            }
-            if media_payload:
-                new_msg["file_url"] = media_payload.get("file_url")
-                new_msg["file_name"] = media_payload.get("file_name")
-                new_msg["mime_type"] = media_payload.get("mime_type")
-                new_msg["attachment_type"] = _detect_bot_attachment_type(media_payload.get("mime_type"), media_payload.get("file_name"))
-
-            cached.append(new_msg)
-            _set_persisted_live_chat_messages(sid, cached)
+            _save_live_chat_message(live_chat_session, LiveChatMessage.SENDER_CUSTOMER, msg_text, media_payload)
         else:
-            logger.info(f"WhatsApp Webhook: Starting fresh chatbot session for customer {customer_phone}.")
+            logger.info(f"WhatsApp Webhook: Starting fresh chatbot session for customer {customer_phone} with text '{msg_text}'.")
             session = WhatsAppChatSession.objects.create(
                 seller_user=config.seller_user,
                 customer_phone=customer_phone,
                 customer_name=customer_name,
                 current_node_id="start"
             )
-            _run_whatsapp_bot(session, msg_text=None, incoming_media_payload=None, config=config)
+            _run_whatsapp_bot(session, msg_text=msg_text, incoming_media_payload=None, config=config)
 
 
 class WhatsAppConfigAPIView(APIView):
@@ -9371,47 +9691,122 @@ class WhatsAppTestConnectionAPIView(APIView):
         if request.user.role.role_id != UserRole.ROLE_SELLER:
             return Response({"success": False, "message": "Only sellers can test connection."}, status=403)
 
-        config_id = request.data.get("config_id")
-        try:
-            if config_id:
-                config = WhatsAppConfig.objects.get(whatsapp_config_id=config_id, seller_user=request.user)
-            else:
-                config = WhatsAppConfig.objects.filter(seller_user=request.user, is_connected=True).first()
-                if not config:
-                    return Response({"success": False, "message": "No active WhatsApp config found."}, status=404)
-        except WhatsAppConfig.DoesNotExist:
-            return Response({"success": False, "message": "WhatsApp config not found."}, status=404)
+        config_id = request.data.get("config_id") or request.data.get("whatsapp_config_id")
+        business_number_input = str(request.data.get("businessNumber") or request.data.get("business_number") or "").strip()
+
+        config_qs = WhatsAppConfig.objects.filter(seller_user=request.user)
+        config = None
+
+        if config_id:
+            config = config_qs.filter(whatsapp_config_id=config_id).first() or config_qs.filter(pk=config_id).first()
+
+        if not config and business_number_input:
+            config = config_qs.filter(phone_number__icontains=business_number_input).first() or config_qs.filter(channel_name__icontains=business_number_input).first()
+            if not config:
+                parts = [p.strip() for p in business_number_input.split("·") if p.strip()]
+                for part in parts:
+                    found = config_qs.filter(phone_number__icontains=part).first() or config_qs.filter(channel_name__icontains=part).first()
+                    if found:
+                        config = found
+                        break
+
+        if not config:
+            config = config_qs.filter(is_connected=True).exclude(phone_number_id="").exclude(access_token="").first()
+
+        if not config:
+            config = config_qs.exclude(phone_number_id="").exclude(access_token="").first()
+
+        if not config:
+            config = config_qs.first()
+
+        if not config or not config.phone_number_id or not config.access_token:
+            return Response({"success": False, "message": "Selected WhatsApp channel is missing Phone Number ID or Access Token. Please configure Meta API credentials in WhatsApp settings."}, status=400)
 
         test_number = (request.data.get("test_number") or "").strip()
         if not test_number:
             return Response({"success": False, "message": "test_number is required."}, status=400)
 
+        LANG_ISO_MAP = {
+            "english (us)": "en_US", "english": "en_US", "en_us": "en_US", "en": "en_US",
+            "hindi": "hi", "hi": "hi",
+            "marathi": "mr", "mr": "mr",
+            "gujarati": "gu", "gu": "gu",
+            "tamil": "ta", "ta": "ta",
+            "telugu": "te", "te": "te",
+            "kannada": "kn", "kn": "kn",
+            "malayalam": "ml", "ml": "ml",
+            "arabic": "ar", "ar": "ar",
+            "french": "fr", "fr": "fr",
+            "portuguese (br)": "pt_BR", "pt_br": "pt_BR",
+            "spanish": "es", "es": "es"
+        }
+
         use_template = request.data.get("use_template", False)
-        template_name = (request.data.get("template_name") or "card_demo").strip()
-        language_code = (request.data.get("language_code") or "en_AE").strip()
+        raw_template_name = (request.data.get("template_name") or "hello_world").strip()
+        raw_language_code = (request.data.get("language_code") or "en_US").strip()
+        custom_header_url = request.data.get("header_media_url") or request.data.get("media_url")
+        custom_body_params = request.data.get("body_params") or {}
+
+        template_name = None
+        tpl_db = None
 
         if use_template:
             from agro_app.models import WhatsAppTemplate
             import re
             
-            # Lookup template in seller's database to inspect media header & body parameters
-            tpl_db = WhatsAppTemplate.objects.filter(
-                seller_user=request.user, 
-                name__iexact=template_name
-            ).first()
+            # Lookup template in seller's database matching selected config first
+            tpl_qs = WhatsAppTemplate.objects.filter(seller_user=request.user, name__iexact=raw_template_name)
+            if not tpl_qs.exists():
+                tpl_qs = WhatsAppTemplate.objects.filter(seller_user=request.user, header_text__iexact=raw_template_name)
+
+            tpl_db = tpl_qs.filter(whatsapp_config=config).first() or tpl_qs.first()
+
+            if not tpl_db:
+                # If requested template is not in DB for this config, pick an approved template for this config
+                tpl_db = WhatsAppTemplate.objects.filter(seller_user=request.user, whatsapp_config=config, status='APPROVED').first()
+                if not tpl_db:
+                    tpl_db = WhatsAppTemplate.objects.filter(seller_user=request.user, status='APPROVED').first()
+
+            if tpl_db:
+                template_name = tpl_db.name.strip()
+                selected_lang = tpl_db.language.strip() if tpl_db.language else raw_language_code
+            else:
+                template_name = raw_template_name.lower().replace(" ", "_")
+                selected_lang = raw_language_code
+
+            language_code = LANG_ISO_MAP.get(selected_lang.lower(), selected_lang)
 
             domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
-            scheme = "https" if (request.is_secure() or "api.qa.syntrrix.com" in domain) else "http"
+            if any(lh in domain.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
+                domain = "api.qa.syntrrix.com"
+            scheme = "https"
 
-            def _build_template_payload(header_fmt=None, body_param_count=0):
+            def _build_template_payload(h_name=None, h_lang=None, header_fmt=None, body_param_count=0, override_media_url=None):
+                t_name = h_name or template_name
+                l_code = h_lang or language_code
                 fmt = (header_fmt or (tpl_db.format if tpl_db else "text")).lower()
+
+                target_media_url = override_media_url or custom_header_url or (tpl_db.header_media.url if tpl_db and tpl_db.header_media else "")
+                if target_media_url:
+                    low_url = str(target_media_url).lower()
+                    if any(ext in low_url for ext in [".mp4", ".mov", ".avi", ".webm", ".3gp"]) or "video" in low_url:
+                        fmt = "video"
+                    elif any(ext in low_url for ext in [".pdf", ".doc", ".docx"]) or "document" in low_url:
+                        fmt = "document"
+                    elif any(ext in low_url for ext in [".jpg", ".jpeg", ".png", ".webp"]) or "image" in low_url:
+                        fmt = "image"
                 components = []
 
                 if fmt == "image":
-                    if tpl_db and tpl_db.header_media:
-                        media_path = tpl_db.header_media.url
-                        img_link = f"{scheme}://{domain}{media_path}" if not media_path.startswith("http") else media_path
-                    else:
+                    img_link = _sanitize_meta_media_url(override_media_url or custom_header_url, domain)
+                    if not img_link and tpl_db and tpl_db.header_media:
+                        try:
+                            m_path = tpl_db.header_media.url
+                            raw_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            img_link = _sanitize_meta_media_url(raw_link, domain)
+                        except Exception:
+                            pass
+                    if not img_link or any(lh in img_link.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
                         img_link = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800&fm=jpg&fit=crop&q=80"
 
                     components.append({
@@ -9426,10 +9821,15 @@ class WhatsAppTestConnectionAPIView(APIView):
                         ]
                     })
                 elif fmt == "video":
-                    if tpl_db and tpl_db.header_media:
-                        media_path = tpl_db.header_media.url
-                        video_link = f"{scheme}://{domain}{media_path}" if not media_path.startswith("http") else media_path
-                    else:
+                    video_link = _sanitize_meta_media_url(override_media_url or custom_header_url, domain)
+                    if not video_link and tpl_db and tpl_db.header_media:
+                        try:
+                            m_path = tpl_db.header_media.url
+                            raw_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            video_link = _sanitize_meta_media_url(raw_link, domain)
+                        except Exception:
+                            pass
+                    if not video_link or any(lh in video_link.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
                         video_link = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
 
                     components.append({
@@ -9444,10 +9844,15 @@ class WhatsAppTestConnectionAPIView(APIView):
                         ]
                     })
                 elif fmt == "document":
-                    if tpl_db and tpl_db.header_media:
-                        media_path = tpl_db.header_media.url
-                        doc_link = f"{scheme}://{domain}{media_path}" if not media_path.startswith("http") else media_path
-                    else:
+                    doc_link = _sanitize_meta_media_url(override_media_url or custom_header_url, domain)
+                    if not doc_link and tpl_db and tpl_db.header_media:
+                        try:
+                            m_path = tpl_db.header_media.url
+                            raw_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            doc_link = _sanitize_meta_media_url(raw_link, domain)
+                        except Exception:
+                            pass
+                    if not doc_link or any(lh in doc_link.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
                         doc_link = "https://pdfobject.com/pdf/sample.pdf"
 
                     components.append({
@@ -9471,7 +9876,7 @@ class WhatsAppTestConnectionAPIView(APIView):
 
                 if var_count > 0:
                     bp_list = []
-                    bp_dict = (tpl_db.body_params if tpl_db and tpl_db.body_params else {}) or {}
+                    bp_dict = custom_body_params or (tpl_db.body_params if tpl_db and tpl_db.body_params else {}) or {}
                     for i in range(1, var_count + 1):
                         val = bp_dict.get(str(i)) or bp_dict.get(i) or f"Sample {i}"
                         bp_list.append({"type": "text", "text": str(val)})
@@ -9481,9 +9886,9 @@ class WhatsAppTestConnectionAPIView(APIView):
                     })
 
                 tpl_obj = {
-                    "name": template_name,
+                    "name": t_name,
                     "language": {
-                        "code": language_code
+                        "code": l_code
                     }
                 }
                 if components:
@@ -9497,17 +9902,42 @@ class WhatsAppTestConnectionAPIView(APIView):
             payload = _build_template_payload()
             ok, err_msg = _send_whatsapp_message_raw(config, test_number, payload)
 
+            # Auto-Retry Error 131053: Media download failed / 403 Forbidden / Private IP (127.0.0.1)
+            if not ok and err_msg and ("131053" in str(err_msg) or "Downloading media" in str(err_msg) or "Forbidden" in str(err_msg) or "private" in str(err_msg).lower()):
+                logger.warning(f"WhatsApp Test Connection: Received Meta Media Download Error 131053 ({err_msg}). Retrying with public CDN media URL...")
+                cdn_fallback_url = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800&fm=jpg&fit=crop&q=80"
+                retry_cdn_payload = _build_template_payload(override_media_url=cdn_fallback_url)
+                ok, err_msg = _send_whatsapp_message_raw(config, test_number, retry_cdn_payload)
+
+            # Auto-Retry Error 132001: Language code translation mismatch or template missing on WABA
+            if not ok and err_msg and ("132001" in str(err_msg) or "translation" in str(err_msg).lower() or "does not exist" in str(err_msg).lower()):
+                logger.warning(f"WhatsApp Test Connection: Received Meta Error 132001 ({err_msg}). Retrying with fallback language/approved templates...")
+                alt_lang = "en_US" if language_code != "en_US" else "en"
+                retry_lang_payload = _build_template_payload(h_lang=alt_lang)
+                ok, err_msg = _send_whatsapp_message_raw(config, test_number, retry_lang_payload)
+
+                if not ok:
+                    approved_tpl = WhatsAppTemplate.objects.filter(seller_user=request.user, whatsapp_config=config, status='APPROVED').first()
+                    if not approved_tpl:
+                        approved_tpl = WhatsAppTemplate.objects.filter(seller_user=request.user, status='APPROVED').first()
+                    if approved_tpl and approved_tpl.name != template_name:
+                        logger.warning(f"WhatsApp Test Connection: Retrying with approved template '{approved_tpl.name}' ({approved_tpl.language})...")
+                        app_lang = LANG_ISO_MAP.get(str(approved_tpl.language).lower(), approved_tpl.language or "en_US")
+                        tpl_db = approved_tpl
+                        retry_approved_payload = _build_template_payload(h_name=approved_tpl.name, h_lang=app_lang)
+                        ok, err_msg = _send_whatsapp_message_raw(config, test_number, retry_approved_payload)
+
             # Smart Auto-Healing: If Meta returns Error #132012 (Format mismatch / missing header/body params), auto-retry with detected format!
             if not ok and err_msg and ("132012" in str(err_msg) or "Format mismatch" in str(err_msg) or "variables" in str(err_msg)):
                 logger.warning(f"WhatsApp Test Connection: Initial template send received format mismatch error ({err_msg}). Auto-detecting Meta header/body parameters...")
                 err_str = str(err_msg).upper()
                 
                 detected_fmt = None
-                if "EXPECTED IMAGE" in err_str:
+                if "EXPECTED IMAGE" in err_str or "IMAGE" in err_str:
                     detected_fmt = "image"
-                elif "EXPECTED VIDEO" in err_str:
+                elif "EXPECTED VIDEO" in err_str or "VIDEO" in err_str:
                     detected_fmt = "video"
-                elif "EXPECTED DOCUMENT" in err_str:
+                elif "EXPECTED DOCUMENT" in err_str or "DOCUMENT" in err_str:
                     detected_fmt = "document"
 
                 # Check if body variable count mismatch error
@@ -9526,17 +9956,39 @@ class WhatsAppTestConnectionAPIView(APIView):
             ok, err_msg = _send_whatsapp_message_raw(config, test_number, payload)
 
         if ok:
-            # Initialize session at 'start' node and wait for customer reply before running bot flow!
-            from agro_app.models import WhatsAppChatSession
+            from agro_app.models import WhatsAppChatSession, LiveChatSession
+            
+            # Check if a live chat session ALREADY exists for this customer (do NOT create new one on template send)
+            existing_live_sess = LiveChatSession.objects.filter(
+                seller_user=request.user,
+                customer__mobile_number=test_number
+            ).first() or LiveChatSession.objects.filter(
+                seller_user=request.user,
+                customer__whatsapp_number=test_number
+            ).first() or LiveChatSession.objects.filter(
+                seller_user=request.user,
+                visitor_mobile_number=test_number
+            ).first()
+
+            if existing_live_sess:
+                if use_template:
+                    t_name = template_name or (tpl_db.name if tpl_db else "Test Template")
+                    t_body = (tpl_db.body if tpl_db else "") or "Test template message."
+                    display_msg = f"[Template Message: {t_name}]\n{t_body}"
+                else:
+                    display_msg = payload.get("text", {}).get("body", "Hello! 👋 This is a test message from Syntrrix (The Intelligent Business Matrix) chatbot integration.")
+                _save_live_chat_message(existing_live_sess, LiveChatMessage.SENDER_SELLER, display_msg)
+
             # Clear any older stale sessions for this customer to start fresh
             WhatsAppChatSession.objects.filter(seller_user=request.user, customer_phone=test_number).delete()
 
-            # Start a new session at the 'start' node
+            # Start a new bot session at the 'start' node (linked to existing_live_sess if present, else None)
             WhatsAppChatSession.objects.create(
                 seller_user=request.user,
                 customer_phone=test_number,
                 current_node_id="start",
-                collected_data={}
+                collected_data={},
+                live_chat_session=existing_live_sess
             )
 
             return Response({"success": True, "message": "Test message sent and chatbot flow initiated successfully."})
@@ -9610,21 +10062,15 @@ def _process_whatsapp_campaign_status_update(status_type, status_recipient, erro
                 cur_deliv = int(deliv_str) if deliv_str.isdigit() else 0
                 if cur_deliv < total_aud:
                     new_deliv = cur_deliv + 1
-                    c.delivered = f"{new_deliv}/{total_aud}"
-
-                    read_str = str(c.read or "0").split("/")[0].strip()
-                    cur_read = int(read_str) if read_str.isdigit() else 0
-                    c.read = f"{cur_read}/{new_deliv}"
-                    c.save(update_fields=["delivered", "read", "updated_at"])
+                    c.delivered = str(new_deliv)
+                    c.save(update_fields=["delivered", "updated_at"])
 
             elif status_type == "read":
-                deliv_str = str(c.delivered or "0").split("/")[0].strip()
-                cur_deliv = int(deliv_str) if deliv_str.isdigit() else 1
                 read_str = str(c.read or "0").split("/")[0].strip()
                 cur_read = int(read_str) if read_str.isdigit() else 0
-                if cur_read < cur_deliv:
+                if cur_read < total_aud:
                     new_read = cur_read + 1
-                    c.read = f"{new_read}/{cur_deliv}"
+                    c.read = str(new_read)
                     c.save(update_fields=["read", "updated_at"])
 
             elif status_type == "failed":
@@ -9764,9 +10210,16 @@ class WhatsAppWebhookAPIView(APIView):
                         interactive = msg.get("interactive") or {}
                         int_type = interactive.get("type")
                         if int_type == "button_reply":
-                            msg_text = interactive.get("button_reply", {}).get("id") or ""
+                            b_reply = interactive.get("button_reply", {})
+                            msg_text = b_reply.get("title") or b_reply.get("id") or ""
                         elif int_type == "list_reply":
-                            msg_text = interactive.get("list_reply", {}).get("id") or ""
+                            l_reply = interactive.get("list_reply", {})
+                            msg_text = l_reply.get("title") or l_reply.get("id") or ""
+                    elif msg_type == "button":
+                        # Meta Cloud API Template Quick Reply Button Response Event
+                        btn_obj = msg.get("button") or {}
+                        msg_text = btn_obj.get("text") or btn_obj.get("payload") or ""
+                        logger.info(f"WhatsApp Webhook: Customer {customer_phone} clicked Template Quick Reply button '{msg_text}'")
                     elif msg_type in ["image", "video", "document", "audio"]:
                         media_id = msg.get(msg_type, {}).get("id")
                         mime_type = msg.get(msg_type, {}).get("mime_type") or ""
@@ -9787,185 +10240,138 @@ class WhatsAppWebhookAPIView(APIView):
         return Response({"success": True}, status=200)
 
 
-class WhatsAppBulkTemplateAPIView(APIView):
-    permission_classes = [IsAuthenticated]
+def _bg_dispatch_bulk_campaign(campaign_id, seller_user_id, config_id, recipients, template_name, language_code, use_template, custom_text, tpl_db_id=None, domain="api.qa.syntrrix.com", scheme="https", custom_header_url=None, var_mapping=None):
+    """
+    Asynchronous Background Worker Thread for WhatsApp Bulk Campaign Dispatch.
+    Loops through recipients, sends Meta Cloud API messages, updates DB recipient statuses,
+    and updates campaign counts (sent, failed, delivered) in real time.
+    """
+    import threading, time, re
+    from agro_app.models import WhatsAppCampaign, WhatsAppCampaignRecipient, WhatsAppConfig, WhatsAppTemplate, User, WhatsAppChatSession, LiveChatSession
 
-    def post(self, request):
-        from agro_app.models import WhatsAppConfig, TeamMember
-        if request.user.role.role_id not in [UserRole.ROLE_SELLER, UserRole.ROLE_TEAM_MANAGER, UserRole.ROLE_AGENT]:
-            return Response({"success": False, "message": "Access denied."}, status=403)
+    logger.info(f"Starting Background Campaign Dispatch for Campaign #{campaign_id} ({len(recipients)} recipients)...")
 
-        # Resolve the seller user who owns the WhatsApp configurations
-        seller_user = request.user
-        if request.user.role.role_id != UserRole.ROLE_SELLER:
-            profile = TeamMember.objects.filter(user=request.user).select_related("seller_user").first()
-            if profile and profile.seller_user:
-                seller_user = profile.seller_user
+    try:
+        campaign = WhatsAppCampaign.objects.get(pk=campaign_id)
+        config = WhatsAppConfig.objects.filter(pk=config_id).first()
+        seller_user = User.objects.get(pk=seller_user_id)
+        tpl_db = WhatsAppTemplate.objects.filter(pk=tpl_db_id).first() if tpl_db_id else None
 
-        config_id = request.data.get("config_id") or request.data.get("whatsapp_config_id")
-        config_qs = WhatsAppConfig.objects.filter(seller_user=seller_user, is_connected=True)
-        if config_id:
-            config = config_qs.filter(whatsapp_config_id=config_id).first()
-        else:
-            config = config_qs.first()
-
-        if not config:
-            config = WhatsAppConfig.objects.filter(seller_user=seller_user).first()
-
-        if not config:
-            return Response({"success": False, "message": "No connected WhatsApp configuration found."}, status=404)
-
-        raw_template_name = (request.data.get("template_name") or "hello_world").strip()
-        raw_language_code = (request.data.get("language_code") or "en_US").strip()
-        use_template = request.data.get("use_template", True)
-        custom_text = (request.data.get("custom_text") or "Hello! 👋 This is a test message from Syntrrix chatbot integration.").strip()
-        recipients = request.data.get("recipients") or []
-
-        if not isinstance(recipients, list) or not recipients:
-            return Response({"success": False, "message": "recipients must be a non-empty list."}, status=400)
-
-        # Smart Meta Slug & Language Resolution:
-        # Find exact registered template in seller's DB by name or header_text
-        from agro_app.models import WhatsAppTemplate
-        from django.db.models import Q
-        tpl_db = WhatsAppTemplate.objects.filter(seller_user=seller_user).filter(
-            Q(name__iexact=raw_template_name) | Q(header_text__iexact=raw_template_name)
-        ).first()
-
-        if tpl_db:
-            template_name = tpl_db.name.strip()
-            language_code = tpl_db.language.strip() if tpl_db.language else raw_language_code
-        else:
-            template_name = raw_template_name.lower().replace(" ", "_")
-            language_code = raw_language_code
-
-        domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
-        scheme = "https" if (request.is_secure() or "api.qa.syntrrix.com" in domain) else "http"
-
-        def _build_bulk_template_payload(header_fmt=None, lang_override=None):
+        def _build_payload(phone_num, item=None, header_fmt=None, lang_override=None):
+            if not use_template:
+                return {
+                    "type": "text",
+                    "text": {"preview_url": False, "body": custom_text}
+                }
             import os
             from django.conf import settings
-            
+
             l_code = lang_override or language_code
             fmt = (header_fmt or (tpl_db.format if tpl_db else "text")).lower()
+
+            target_media_url = custom_header_url or (tpl_db.header_media.url if tpl_db and tpl_db.header_media else "")
+            if target_media_url:
+                low_url = str(target_media_url).lower()
+                if any(ext in low_url for ext in [".mp4", ".mov", ".avi", ".webm", ".3gp"]) or "video" in low_url:
+                    fmt = "video"
+                elif any(ext in low_url for ext in [".pdf", ".doc", ".docx"]) or "document" in low_url:
+                    fmt = "document"
+                elif any(ext in low_url for ext in [".jpg", ".jpeg", ".png", ".webp"]) or "image" in low_url:
+                    fmt = "image"
             components = []
 
             if fmt == "image":
-                img_link = None
-                if tpl_db and tpl_db.header_media:
+                img_link = _sanitize_meta_media_url(custom_header_url, domain)
+                if not img_link and tpl_db and tpl_db.header_media:
                     try:
                         m_path = tpl_db.header_media.url
                         rel_name = tpl_db.header_media.name
                         abs_disk_path = os.path.join(settings.MEDIA_ROOT, rel_name)
                         if os.path.exists(abs_disk_path) and os.path.getsize(abs_disk_path) > 0:
-                            img_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
-                        else:
-                            logger.warning(f"Header media file missing on disk ({abs_disk_path}). Using reliable fallback image URL for Meta delivery.")
-                    except Exception as ex:
-                        logger.error(f"Error checking header media file existence: {ex}")
-
-                if not img_link:
-                    img_link = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800&fm=jpg&fit=crop&q=80"
-
-                components.append({
-                    "type": "header",
-                    "parameters": [
-                        {
-                            "type": "image",
-                            "image": {
-                                "link": img_link
-                            }
-                        }
-                    ]
-                })
-            elif fmt == "video":
-                video_link = None
-                if tpl_db and tpl_db.header_media:
-                    try:
-                        m_path = tpl_db.header_media.url
-                        rel_name = tpl_db.header_media.name
-                        abs_disk_path = os.path.join(settings.MEDIA_ROOT, rel_name)
-                        if os.path.exists(abs_disk_path) and os.path.getsize(abs_disk_path) > 0:
-                            video_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            raw_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            img_link = _sanitize_meta_media_url(raw_link, domain)
                     except Exception:
                         pass
-
-                if not video_link:
+                if not img_link or any(lh in img_link.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
+                    img_link = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800&fm=jpg&fit=crop&q=80"
+                components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": img_link}}]})
+            elif fmt == "video":
+                video_link = _sanitize_meta_media_url(custom_header_url, domain)
+                if not video_link and tpl_db and tpl_db.header_media:
+                    try:
+                        m_path = tpl_db.header_media.url
+                        rel_name = tpl_db.header_media.name
+                        abs_disk_path = os.path.join(settings.MEDIA_ROOT, rel_name)
+                        if os.path.exists(abs_disk_path) and os.path.getsize(abs_disk_path) > 0:
+                            raw_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            video_link = _sanitize_meta_media_url(raw_link, domain)
+                    except Exception:
+                        pass
+                if not video_link or any(lh in video_link.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
                     video_link = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
-
-                components.append({
-                    "type": "header",
-                    "parameters": [
-                        {
-                            "type": "video",
-                            "video": {
-                                "link": video_link
-                            }
-                        }
-                    ]
-                })
+                components.append({"type": "header", "parameters": [{"type": "video", "video": {"link": video_link}}]})
             elif fmt == "document":
-                if tpl_db and tpl_db.header_media:
-                    m_path = tpl_db.header_media.url
-                    doc_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
-                else:
+                doc_link = _sanitize_meta_media_url(custom_header_url, domain)
+                if not doc_link and tpl_db and tpl_db.header_media:
+                    try:
+                        m_path = tpl_db.header_media.url
+                        rel_name = getattr(tpl_db.header_media, 'name', '')
+                        abs_disk_path = os.path.join(settings.MEDIA_ROOT, rel_name) if rel_name else ""
+                        if abs_disk_path and os.path.exists(abs_disk_path) and os.path.getsize(abs_disk_path) > 0:
+                            raw_link = f"{scheme}://{domain}{m_path}" if not m_path.startswith("http") else m_path
+                            doc_link = _sanitize_meta_media_url(raw_link, domain)
+                    except Exception:
+                        pass
+                if not doc_link or any(lh in doc_link.lower() for lh in ["127.0.0.1", "localhost", "0.0.0.0"]):
                     doc_link = "https://pdfobject.com/pdf/sample.pdf"
+                components.append({"type": "header", "parameters": [{"type": "document", "document": {"link": doc_link, "filename": "Document.pdf"}}]})
 
-                components.append({
-                    "type": "header",
-                    "parameters": [
-                        {
-                            "type": "document",
-                            "document": {
-                                "link": doc_link,
-                                "filename": "Document.pdf"
-                            }
-                        }
-                    ]
-                })
+            # Handle body variable mapping
+            matches = re.findall(r"\{\{(\d+)\}\}", tpl_db.body) if (tpl_db and tpl_db.body) else []
+            var_count = len(set(matches))
+            if var_count > 0:
+                bp_list = []
+                vm = var_mapping or {}
+                for i in range(1, var_count + 1):
+                    col_key = vm.get(str(i)) or vm.get(i)
+                    val = item.get(col_key) if (col_key and isinstance(item, dict)) else None
+                    if not val and isinstance(item, dict):
+                        if i == 1:
+                            val = item.get("name") or item.get("customer_name") or "Customer"
+                        elif i == 2:
+                            val = item.get("order") or item.get("email") or "Order"
+                        else:
+                            val = f"Value {i}"
+                    bp_list.append({"type": "text", "text": str(val or f"Sample {i}")})
+                components.append({"type": "body", "parameters": bp_list})
 
-            tpl_obj = {
-                "name": template_name,
-                "language": {
-                    "code": l_code
-                }
-            }
+            tpl_obj = {"name": template_name, "language": {"code": l_code}}
             if components:
                 tpl_obj["components"] = components
 
-            return {
-                "type": "template",
-                "template": tpl_obj
-            }
+            return {"type": "template", "template": tpl_obj}
 
         success_count = 0
         failed_count = 0
-        errors = []
+        total_aud = len(recipients)
 
         for item in recipients:
-            phone = str(item.get("phone") or "").strip()
+            phone = str(item.get("phone") or item.get("phone_number") or "").strip()
+            name = str(item.get("name") or item.get("customer_name") or "Recipient").strip()
             if not phone:
                 failed_count += 1
                 continue
 
-            if use_template:
-                payload = _build_bulk_template_payload()
-            else:
-                payload = {
-                    "type": "text",
-                    "text": {"preview_url": False, "body": custom_text}
-                }
-
+            payload = _build_payload(phone, item=item)
             ok, err_msg = _send_whatsapp_message_raw(config, phone, payload)
 
-            # Auto-Retry for Error 132001 (Template translation mismatch):
+            # Auto-Retry Error 132001
             if not ok and err_msg and ("132001" in str(err_msg) or "translation" in str(err_msg).lower()):
                 alt_lang = "en" if language_code == "en_US" else "en_US"
-                logger.warning(f"WhatsApp Bulk Template Send: Received Meta Error 132001 for {template_name} ({language_code}). Retrying with alternate language '{alt_lang}'...")
-                retry_payload = _build_bulk_template_payload(lang_override=alt_lang)
+                retry_payload = _build_payload(phone, item=item, lang_override=alt_lang)
                 ok, err_msg = _send_whatsapp_message_raw(config, phone, retry_payload)
 
-            # Auto-Retry for Error 132012 (Header Format mismatch - EXPECTED IMAGE / VIDEO / DOCUMENT):
+            # Auto-Retry Error 132012
             if not ok and err_msg and ("132012" in str(err_msg) or "Format mismatch" in str(err_msg) or "expected" in str(err_msg).lower()):
                 err_str = str(err_msg).upper()
                 detected_fmt = None
@@ -9977,35 +10383,433 @@ class WhatsAppBulkTemplateAPIView(APIView):
                     detected_fmt = "document"
 
                 if detected_fmt:
-                    logger.warning(f"WhatsApp Bulk Template Send: Received format mismatch error 132012. Auto-retrying with header format '{detected_fmt}'...")
-                    retry_fmt_payload = _build_bulk_template_payload(header_fmt=detected_fmt)
+                    retry_fmt_payload = _build_payload(phone, item=item, header_fmt=detected_fmt)
                     ok, err_msg = _send_whatsapp_message_raw(config, phone, retry_fmt_payload)
+
+            # Match or create recipient log object
+            from django.utils import timezone
+            now_dispatch_time = timezone.now()
+
+            rec_obj = WhatsAppCampaignRecipient.objects.filter(campaign=campaign, phone_number=phone).first()
+            if not rec_obj:
+                rec_obj = WhatsAppCampaignRecipient.objects.create(
+                    campaign=campaign,
+                    phone_number=phone,
+                    customer_name=name,
+                    timestamp=now_dispatch_time,
+                )
 
             if ok:
                 success_count += 1
+                rec_obj.sent_status = True
+                rec_obj.delivered_status = True
+                rec_obj.sent_error = ""
+                rec_obj.delivered_error = ""
+                rec_obj.timestamp = now_dispatch_time
+                rec_obj.save(update_fields=["sent_status", "delivered_status", "sent_error", "delivered_error", "timestamp"])
+
                 try:
-                    from agro_app.models import WhatsAppChatSession
-                    # Reset session for customer so it is ready at 'start' node and waits for user reply
+                    # Check if a live chat session ALREADY exists for this recipient (do NOT create new one on campaign send)
+                    existing_live_sess = LiveChatSession.objects.filter(
+                        seller_user=seller_user,
+                        customer__mobile_number=phone
+                    ).first() or LiveChatSession.objects.filter(
+                        seller_user=seller_user,
+                        customer__whatsapp_number=phone
+                    ).first() or LiveChatSession.objects.filter(
+                        seller_user=seller_user,
+                        visitor_mobile_number=phone
+                    ).first()
+
+                    if existing_live_sess:
+                        t_name = template_name or (tpl_db.name if tpl_db else "Campaign Template")
+                        t_body = (tpl_db.body if tpl_db else custom_text) or "Campaign message"
+                        display_msg = f"[Template Message: {t_name}]\n{t_body}" if use_template else (custom_text or "Campaign message")
+                        _save_live_chat_message(existing_live_sess, LiveChatMessage.SENDER_SELLER, display_msg)
+
                     WhatsAppChatSession.objects.filter(seller_user=seller_user, customer_phone=phone).delete()
                     WhatsAppChatSession.objects.create(
                         seller_user=seller_user,
                         customer_phone=phone,
+                        customer_name=name,
                         current_node_id="start",
-                        collected_data={}
+                        collected_data={},
+                        live_chat_session=existing_live_sess
                     )
-                except Exception as bot_ex:
-                    logger.error(f"Failed to initialize WhatsAppChatSession for {phone}: {bot_ex}")
+                except Exception as tpl_ex:
+                    logger.error(f"Error preparing chatbot session for campaign recipient {phone}: {tpl_ex}")
             else:
                 failed_count += 1
-                errors.append(f"Failed to send to {phone}: {err_msg}")
+                rec_obj.sent_status = False
+                rec_obj.sent_error = err_msg or "Failed to dispatch template via Meta API"
+                rec_obj.timestamp = now_dispatch_time
+                rec_obj.save(update_fields=["sent_status", "sent_error", "timestamp"])
 
+            # Real-time DB campaign counters update
+            campaign.sent = str(success_count)
+            campaign.failed = str(failed_count)
+            campaign.delivered = f"{success_count}/{total_aud}"
+            campaign.save(update_fields=["sent", "failed", "delivered", "updated_at"])
+
+            time.sleep(0.05)
+
+        # Finalize Campaign Status: Running -> Completed
+        final_status = "Completed" if (success_count > 0 or failed_count == 0) else "Failed"
+        campaign.status = final_status
+        campaign.sent = str(success_count)
+        campaign.failed = str(failed_count)
+        campaign.delivered = f"{success_count}/{total_aud}"
+        campaign.save(update_fields=["status", "sent", "failed", "delivered", "updated_at"])
+        logger.info(f"Background Campaign Dispatch Finished for #{campaign_id}! Final Status: {final_status}, Sent: {success_count}, Failed: {failed_count}")
+
+    except Exception as ex:
+        import traceback
+        logger.error(f"Error in background campaign worker for #{campaign_id}: {ex}\n{traceback.format_exc()}")
+
+
+_scheduled_checker_started = False
+_scheduled_checker_lock = threading.Lock()
+
+
+def check_and_dispatch_scheduled_campaigns():
+    """
+    Checks DB for any WhatsAppCampaign records with status='Scheduled'
+    where scheduled_at <= current time, and launches background dispatch worker.
+    Uses atomic SQL status update (UPDATE ... WHERE status='Scheduled') to guarantee
+    EXACTLY ONCE execution across concurrent threads and processes.
+    """
+    try:
+        from django.utils import timezone
+        from agro_app.models import WhatsAppCampaign
+
+        now = timezone.now()
+        due_ids = list(WhatsAppCampaign.objects.filter(
+            status="Scheduled",
+            scheduled_at__lte=now
+        ).values_list("campaign_id", flat=True))
+
+        for cid in due_ids:
+            # ATOMIC CLAIM: Update status='Running' ONLY if status is still 'Scheduled' at SQL level
+            claimed_count = WhatsAppCampaign.objects.filter(
+                campaign_id=cid,
+                status="Scheduled"
+            ).update(status="Running", updated_at=now)
+
+            if claimed_count == 1:
+                # Exactly one process/thread succeeded in claiming this campaign!
+                campaign = WhatsAppCampaign.objects.get(pk=cid)
+                logger.info(f"Scheduled Campaign #{campaign.campaign_id} '{campaign.title}' ATOMICALLY CLAIMED! Launching background worker...")
+
+                payload = campaign.scheduled_payload or {}
+                seller_user_id = payload.get("seller_user_id") or campaign.seller_user_id
+                config_id = payload.get("config_id")
+                recipients = payload.get("recipients") or []
+                template_name = payload.get("template_name") or campaign.template_name
+                language_code = payload.get("language_code") or "en_US"
+                use_template = payload.get("use_template", True)
+                custom_text = payload.get("custom_text") or ""
+                tpl_db_id = payload.get("tpl_db_id")
+                domain = payload.get("domain") or "api.qa.syntrrix.com"
+                scheme = payload.get("scheme") or "https"
+                custom_header_url = payload.get("custom_header_url")
+                var_mapping = payload.get("var_mapping") or {}
+
+                t = threading.Thread(
+                    target=_bg_dispatch_bulk_campaign,
+                    kwargs={
+                        "campaign_id": campaign.campaign_id,
+                        "seller_user_id": seller_user_id,
+                        "config_id": config_id,
+                        "recipients": recipients,
+                        "template_name": template_name,
+                        "language_code": language_code,
+                        "use_template": use_template,
+                        "custom_text": custom_text,
+                        "tpl_db_id": tpl_db_id,
+                        "domain": domain,
+                        "scheme": scheme,
+                        "custom_header_url": custom_header_url,
+                        "var_mapping": var_mapping,
+                    },
+                    daemon=True
+                )
+                t.start()
+            else:
+                logger.info(f"Scheduled Campaign #{cid} was already claimed by another worker thread. Skipping duplicate execution.")
+    except Exception as ex:
+        logger.error(f"Error in check_and_dispatch_scheduled_campaigns: {ex}")
+
+
+def start_scheduled_campaign_checker_daemon():
+    global _scheduled_checker_started
+    with _scheduled_checker_lock:
+        if _scheduled_checker_started:
+            return
+        _scheduled_checker_started = True
+
+    import os, sys
+    # Avoid starting thread in Django auto-reloader parent process
+    if os.environ.get("RUN_MAIN") != "true" and "runserver" in getattr(sys, "argv", []):
+        logger.info("Skipping scheduler daemon in Django auto-reloader parent process.")
+        return
+
+    def _loop():
+        import time
+        logger.info("Started WhatsApp Scheduled Campaign Background Checker Loop.")
+        while True:
+            try:
+                check_and_dispatch_scheduled_campaigns()
+            except Exception as e:
+                logger.error(f"Error in scheduled campaign loop: {e}")
+            time.sleep(15)
+
+    t = threading.Thread(target=_loop, daemon=True, name="WhatsAppCampaignScheduler")
+    t.start()
+
+
+class WhatsAppBulkTemplateAPIView(APIView):
+    """
+    WhatsApp Bulk Template / Campaign Dispatch API.
+    Creates a WhatsAppCampaign record in DB instantly with status='Running' or status='Scheduled',
+    launches a non-blocking background thread or schedules execution, and returns HTTP 200 immediately.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from agro_app.models import WhatsAppConfig, WhatsAppCampaign, WhatsAppCampaignRecipient, WhatsAppTemplate
+        from django.db.models import Q
+
+        seller_user = request.user
+        config = None
+        config_id = request.data.get("config_id") or request.data.get("whatsapp_config_id")
+        business_number_str = str(request.data.get("business_number") or request.data.get("phone_number") or "").strip()
+        channel_name_str = str(request.data.get("channel_name") or "").strip()
+        raw_template_name = (request.data.get("template_name") or "hello_world").strip()
+
+        # Step 1: Find template DB record first
+        tpl_db = WhatsAppTemplate.objects.filter(seller_user=seller_user).filter(
+            Q(name__iexact=raw_template_name) | Q(header_text__iexact=raw_template_name)
+        ).first()
+
+        config_qs = WhatsAppConfig.objects.filter(seller_user=seller_user)
+
+        # Step 2: Lookup config by config_id / whatsapp_config_id
+        if config_id:
+            config = config_qs.filter(whatsapp_config_id=config_id).first() or \
+                     config_qs.filter(phone_number_id=config_id).first() or \
+                     config_qs.filter(pk=config_id if str(config_id).isdigit() else None).first()
+
+        # Step 3: Lookup config by business_number string or channel_name string
+        if not config and (business_number_str or channel_name_str):
+            for c in config_qs:
+                p_num = str(c.phone_number or "").strip()
+                c_name = str(c.channel_name or "").strip()
+                if p_num and p_num in business_number_str:
+                    config = c
+                    break
+                if c_name and (c_name in business_number_str or c_name in channel_name_str):
+                    config = c
+                    break
+
+        # Step 4: If config is still not resolved, use tpl_db's linked whatsapp_config!
+        if not config and tpl_db and tpl_db.whatsapp_config:
+            config = tpl_db.whatsapp_config
+
+        # Step 5: Fallback to connected config
+        if not config:
+            config = config_qs.filter(is_connected=True).exclude(phone_number_id="").exclude(access_token="").first() or config_qs.first()
+
+        if not config:
+            return Response({"success": False, "message": "No connected WhatsApp configuration found."}, status=404)
+
+        raw_language_code = (request.data.get("language_code") or "en_US").strip()
+        use_template = request.data.get("use_template", True)
+        custom_text = (request.data.get("custom_text") or "Hello! 👋 This is a test message from Syntrrix chatbot integration.").strip()
+        recipients = request.data.get("recipients") or []
+
+        if not isinstance(recipients, list) or not recipients:
+            return Response({"success": False, "message": "recipients must be a non-empty list."}, status=400)
+
+        if tpl_db:
+            template_name = tpl_db.name.strip()
+            language_code = tpl_db.language.strip() if tpl_db.language else raw_language_code
+        else:
+            template_name = raw_template_name.lower().replace(" ", "_")
+            language_code = raw_language_code
+
+        domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
+        scheme = "https" if (request.is_secure() or "api.qa.syntrrix.com" in domain) else "http"
+
+        total_aud = len(recipients)
+        campaign_title = str(request.data.get("campaign_title") or request.data.get("title") or f"Campaign · {template_name}").strip()
+        subtitle = str(request.data.get("subtitle") or f"Wizard · {template_name}").strip()
+        author_str = str(request.data.get("author") or "By you (Wizard)").strip()
+        bus_num = str(request.data.get("business_number") or f"{config.channel_name or 'Syntrrix Main'} · +{config.phone_number_id or '919000012345'}").strip()
+
+        custom_header_url = request.data.get("header_media_url") or request.data.get("media_url")
+        var_mapping = request.data.get("var_mapping") or {}
+
+        if custom_header_url and tpl_db:
+            try:
+                if "/media/" in str(custom_header_url):
+                    rel_p = str(custom_header_url).split("/media/")[-1]
+                    if rel_p and tpl_db.header_media.name != rel_p:
+                        tpl_db.header_media.name = rel_p
+                        tpl_db.save(update_fields=['header_media'])
+                        logger.info(f"Updated WhatsAppTemplate #{tpl_db.template_id} header_media to '{rel_p}' before campaign dispatch.")
+            except Exception as update_ex:
+                logger.error(f"Error updating tpl_db header_media in bulk template view: {update_ex}")
+
+        # Delivery & Schedule Parsing (Indian Standard Time - Asia/Kolkata UTC+05:30)
+        send_option = str(request.data.get("send_option") or request.data.get("delivery_option") or "now").strip().lower()
+        raw_scheduled_at = request.data.get("scheduled_at") or request.data.get("scheduled_time") or request.data.get("scheduledDateTime")
+
+        scheduled_dt = None
+        if send_option == "schedule" or raw_scheduled_at:
+            if raw_scheduled_at:
+                from django.utils.dateparse import parse_datetime
+                from django.utils import timezone
+                import datetime, zoneinfo
+                from datetime import timezone as py_timezone, timedelta as py_timedelta
+
+                try:
+                    ist_tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+                except Exception:
+                    ist_tz = py_timezone(py_timedelta(hours=5, minutes=30))
+
+                if isinstance(raw_scheduled_at, str):
+                    parsed = parse_datetime(raw_scheduled_at)
+                    if not parsed:
+                        try:
+                            parsed = datetime.datetime.fromisoformat(raw_scheduled_at)
+                        except Exception:
+                            pass
+                    if parsed:
+                        if timezone.is_naive(parsed):
+                            scheduled_dt = parsed.replace(tzinfo=ist_tz)
+                        else:
+                            scheduled_dt = parsed.astimezone(ist_tz)
+
+        is_scheduled = (send_option == "schedule") and (scheduled_dt is not None)
+        initial_status = "Scheduled" if is_scheduled else "Running"
+
+        scheduled_payload_data = {
+            "seller_user_id": seller_user.id,
+            "config_id": config.pk,
+            "recipients": recipients,
+            "template_name": template_name,
+            "language_code": language_code,
+            "use_template": use_template,
+            "custom_text": custom_text,
+            "tpl_db_id": tpl_db.pk if tpl_db else None,
+            "domain": domain,
+            "scheme": scheme,
+            "custom_header_url": custom_header_url,
+            "var_mapping": var_mapping,
+        }
+
+        # 1. Create WhatsAppCampaign in DB
+        from agro_app.models import WhatsAppCampaign, WhatsAppCampaignRecipient
+        campaign_kwargs = {
+            "seller_user": seller_user,
+            "title": campaign_title,
+            "status": initial_status,
+            "subtitle": subtitle,
+            "business_number": bus_num,
+            "template_name": template_name,
+            "channel_name": config.channel_name or "WhatsApp",
+            "audience": total_aud,
+            "sent": "0",
+            "delivered": f"0/{total_aud}",
+            "read": f"0/{total_aud}",
+            "failed": "0",
+            "author": author_str,
+        }
+        if hasattr(WhatsAppCampaign, "scheduled_at"):
+            campaign_kwargs["scheduled_at"] = scheduled_dt if is_scheduled else None
+            campaign_kwargs["scheduled_payload"] = scheduled_payload_data if is_scheduled else {}
+
+        campaign = WhatsAppCampaign.objects.create(**campaign_kwargs)
+
+        # 2. Bulk-create recipient entries in DB
+        recipient_objs = []
+        for item in recipients:
+            p_num = str(item.get("phone") or item.get("phone_number") or "").strip()
+            if p_num:
+                c_name = str(item.get("name") or item.get("customer_name") or "Recipient").strip()
+                recipient_objs.append(
+                    WhatsAppCampaignRecipient(
+                        campaign=campaign,
+                        phone_number=p_num,
+                        customer_name=c_name,
+                        sent_status=False,
+                    )
+                )
+        if recipient_objs:
+            WhatsAppCampaignRecipient.objects.bulk_create(recipient_objs)
+
+        if is_scheduled:
+            formatted_dt_str = scheduled_dt.strftime("%d %b %Y, %I:%M %p IST")
+            return Response({
+                "success": True,
+                "campaign_id": campaign.campaign_id,
+                "status": "Scheduled",
+                "scheduled_at": scheduled_dt.isoformat(),
+                "message": f"Bulk campaign '{campaign.title}' scheduled for {formatted_dt_str} for {total_aud} recipients.",
+                "data": {
+                    "id": campaign.campaign_id,
+                    "title": campaign.title,
+                    "status": "Scheduled",
+                    "audience": total_aud,
+                    "sent": "0",
+                    "delivered": f"0/{total_aud}",
+                    "read": f"0/{total_aud}",
+                    "failed": "0",
+                    "date": campaign.created_at.strftime("%m/%d/%Y"),
+                    "scheduled_at": scheduled_dt.isoformat(),
+                }
+            }, status=200)
+
+        # 3. Immediate background dispatch thread
+        t = threading.Thread(
+            target=_bg_dispatch_bulk_campaign,
+            kwargs={
+                "campaign_id": campaign.campaign_id,
+                "seller_user_id": seller_user.id,
+                "config_id": config.pk,
+                "recipients": recipients,
+                "template_name": template_name,
+                "language_code": language_code,
+                "use_template": use_template,
+                "custom_text": custom_text,
+                "tpl_db_id": tpl_db.pk if tpl_db else None,
+                "domain": domain,
+                "scheme": scheme,
+                "custom_header_url": custom_header_url,
+                "var_mapping": var_mapping,
+            },
+            daemon=True
+        )
+        t.start()
+
+        # 4. Instant HTTP 200 Response
         return Response({
-            "success": success_count > 0 or failed_count == 0,
-            "sent_count": success_count,
-            "failed_count": failed_count,
-            "message": f"Bulk campaign completed. Sent: {success_count}, Failed: {failed_count}.",
-            "errors": errors
-        })
+            "success": True,
+            "campaign_id": campaign.campaign_id,
+            "status": "Running",
+            "message": f"Bulk campaign '{campaign.title}' initiated for {total_aud} recipients. Running in background.",
+            "data": {
+                "id": campaign.campaign_id,
+                "title": campaign.title,
+                "status": "Running",
+                "audience": total_aud,
+                "sent": "0",
+                "delivered": f"0/{total_aud}",
+                "read": f"0/{total_aud}",
+                "failed": "0",
+                "date": campaign.created_at.strftime("%m/%d/%Y"),
+            }
+        }, status=200)
 
 
 # ==========================================
@@ -10017,20 +10821,35 @@ class LoginAPIView(APIView):
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
-        if serializer.is_valid():
+        try:
+            serializer.is_valid(raise_exception=True)
             user = serializer.validated_data["user"]
             refresh = RefreshToken.for_user(user)
-            user_full = User.objects.select_related("role", "meta", "plan").get(id=user.id)
+            user_data = UserDetailSerializer(user).data
+            response_payload = {
+                "success": True,
+                "message": "Login successful.",
+                "token_type": "Bearer",
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+                "user": user_data,
+            }
+            return Response(response_payload, status=status.HTTP_200_OK)
+        except serializers.ValidationError as exc:
+            return Response(
+                {"success": False, "errors": exc.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected error during login")
+            err_msg = str(exc) if getattr(settings, "DEBUG", False) else "Unexpected error occurred. Please try again later."
             return Response(
                 {
-                    "success": True,
-                    "access": str(refresh.access_token),
-                    "refresh": str(refresh),
-                    "user": UserDetailSerializer(user_full).data,
+                    "success": False,
+                    "message": err_msg,
                 },
-                status=status.HTTP_200_OK,
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-        return Response({"success": False, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class BuyerAPIView(APIView):
@@ -10226,6 +11045,127 @@ class SellerAPIView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class WhatsAppMediaUploadAPIView(APIView):
+    """
+    Media Upload API Endpoint for WhatsApp Templates and Campaigns (Image, Video, Document).
+    Accepts multipart/form-data with 'file', 'media', 'header_media', or 'image'.
+    Saves file to server disk under MEDIA_ROOT/whatsapp_template_headers/ and replaces previous file.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        uploaded_file = request.FILES.get("file") or request.FILES.get("media") or request.FILES.get("header_media") or request.FILES.get("image")
+        # Meta WhatsApp API Maximum Header File Size Validation (16 MB)
+        file_size = getattr(uploaded_file, 'size', 0)
+        if file_size > 16777216:
+            mb_size = round(file_size / (1024 * 1024), 2)
+            return Response({
+                "success": False,
+                "message": f"File size ({mb_size} MB) exceeds maximum allowed limit of 16 MB for Meta WhatsApp video media."
+            }, status=400)
+
+        import os, uuid
+        from django.conf import settings
+
+        media_dir = os.path.join(settings.MEDIA_ROOT, 'whatsapp_template_headers')
+        os.makedirs(media_dir, exist_ok=True)
+
+        orig_name = getattr(uploaded_file, 'name', 'media_file')
+        ext = os.path.splitext(orig_name)[1].lower() or '.jpg'
+        mime_type = getattr(uploaded_file, 'content_type', '') or 'application/octet-stream'
+
+        safe_filename = f"header_{uuid.uuid4().hex[:8]}{ext}"
+        full_disk_path = os.path.join(media_dir, safe_filename)
+
+        with open(full_disk_path, 'wb') as f_disk:
+            for chunk in uploaded_file.chunks():
+                f_disk.write(chunk)
+
+        # Automatic Backend FFmpeg Video Compression & H.264 MP4 Optimization
+        if ext in ['.mp4', '.mov', '.avi', '.mkv', '.3gp', '.webm']:
+            try:
+                import shutil, subprocess
+                ffmpeg_bin = shutil.which("ffmpeg")
+                if ffmpeg_bin:
+                    compressed_filename = f"header_{uuid.uuid4().hex[:8]}.mp4"
+                    compressed_disk_path = os.path.join(media_dir, compressed_filename)
+                    cmd = [
+                        ffmpeg_bin, "-y", "-i", full_disk_path,
+                        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
+                        "-acodec", "aac", "-movflags", "+faststart",
+                        compressed_disk_path
+                    ]
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                    if res.returncode == 0 and os.path.exists(compressed_disk_path) and os.path.getsize(compressed_disk_path) > 0:
+                        if os.path.exists(full_disk_path) and full_disk_path != compressed_disk_path:
+                            try:
+                                os.remove(full_disk_path)
+                            except Exception:
+                                pass
+                        safe_filename = compressed_filename
+                        full_disk_path = compressed_disk_path
+                        ext = ".mp4"
+                        mime_type = "video/mp4"
+                        logger.info(f"Successfully compressed and optimized video file using FFmpeg: {compressed_filename}")
+            except Exception as ffmpeg_ex:
+                logger.warning(f"Backend FFmpeg video compression skipped/failed: {ffmpeg_ex}")
+
+        domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
+        scheme = "https" if (request.is_secure() or ("api.qa.syntrrix.com" in domain and not any(lh in domain for lh in ["127.0.0.1", "localhost"]))) else "http"
+
+        file_url = f"{scheme}://{domain}/media/whatsapp_template_headers/{safe_filename}"
+        rel_media_path = f"whatsapp_template_headers/{safe_filename}"
+
+        # If template_id or template_name is provided, update the template's header_media DB field directly
+        tpl_id = request.POST.get("template_id") or request.data.get("template_id")
+        tpl_name = request.POST.get("template_name") or request.data.get("template_name")
+
+        if tpl_id or tpl_name:
+            try:
+                from agro_app.models import WhatsAppTemplate
+                tpl_all = WhatsAppTemplate.objects.all()
+                tpl = None
+                if tpl_id:
+                    tpl = tpl_all.filter(seller_user=request.user, pk=tpl_id if str(tpl_id).isdigit() else None).first() or \
+                          tpl_all.filter(pk=tpl_id if str(tpl_id).isdigit() else None).first() or \
+                          tpl_all.filter(seller_user=request.user, template_id=tpl_id if str(tpl_id).isdigit() else None).first() or \
+                          tpl_all.filter(template_id=tpl_id if str(tpl_id).isdigit() else None).first() or \
+                          tpl_all.filter(seller_user=request.user, name__iexact=str(tpl_id)).first() or \
+                          tpl_all.filter(name__iexact=str(tpl_id)).first()
+                if not tpl and tpl_name:
+                    tpl = tpl_all.filter(seller_user=request.user, name__iexact=str(tpl_name)).first() or \
+                          tpl_all.filter(name__iexact=str(tpl_name)).first()
+
+                if tpl:
+                    # Remove previous media file on disk if replacing
+                    if tpl.header_media and hasattr(tpl.header_media, 'name') and tpl.header_media.name:
+                        old_rel = tpl.header_media.name
+                        old_disk = os.path.join(settings.MEDIA_ROOT, old_rel)
+                        if os.path.exists(old_disk) and old_disk != full_disk_path:
+                            try:
+                                os.remove(old_disk)
+                                logger.info(f"Removed previous template header file from disk: {old_disk}")
+                            except Exception as rm_ex:
+                                logger.warning(f"Could not remove old template header file: {rm_ex}")
+
+                    tpl.header_media.name = rel_media_path
+                    tpl.save(update_fields=['header_media'])
+                    logger.info(f"Successfully replaced header_media for template '{tpl.name}' (ID: {tpl.template_id}) to '{rel_media_path}'")
+            except Exception as ex_tpl:
+                logger.error(f"Failed to update template header_media DB field: {ex_tpl}")
+
+        logger.info(f"WhatsApp Media Upload SUCCESS: {orig_name} -> {file_url} (MIME: {mime_type})")
+
+        return Response({
+            "success": True,
+            "message": "Media uploaded and replaced successfully.",
+            "file_url": file_url,
+            "media_url": file_url,
+            "file_name": orig_name,
+            "mime_type": mime_type
+        }, status=200)
+
+
 class WhatsAppTemplateAPIView(APIView):
     """
     WhatsApp Templates Management & Meta Creation Endpoint
@@ -10244,7 +11184,51 @@ class WhatsAppTemplateAPIView(APIView):
         if config_id:
             templates_qs = templates_qs.filter(whatsapp_config_id=config_id)
         
-        templates_qs = templates_qs.order_by("-created_at")
+        domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
+        scheme = "https" if (request.is_secure() or "api.qa.syntrrix.com" in domain) else "http"
+
+        def _resolve_template_media(t):
+            if t.header_media:
+                try:
+                    rel_url = t.header_media.url if hasattr(t.header_media, 'url') else str(t.header_media)
+                    if rel_url:
+                        if rel_url.startswith("http://") or rel_url.startswith("https://"):
+                            return rel_url
+                        clean_rel = rel_url if rel_url.startswith("/") else f"/{rel_url}"
+                        return f"{scheme}://{domain}{clean_rel}"
+                except Exception:
+                    pass
+
+            if t.header_handle and (t.header_handle.startswith("http://") or t.header_handle.startswith("https://")):
+                return t.header_handle
+
+            import os, re
+            from django.conf import settings
+            t_fmt = str(t.format or "").lower().strip()
+            if t_fmt in ["video", "image", "document"]:
+                clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '', t.name)
+                search_dirs = [
+                    os.path.join(settings.MEDIA_ROOT, 'whatsapp_template_headers'),
+                    os.path.join(settings.MEDIA_ROOT, 'whatsapp_media')
+                ]
+                for s_dir in search_dirs:
+                    if os.path.exists(s_dir):
+                        for f_name in os.listdir(s_dir):
+                            if (clean_name and clean_name.lower() in f_name.lower()) or t.name.lower() in f_name.lower():
+                                folder = os.path.basename(s_dir)
+                                rel_path = f"{folder}/{f_name}"
+                                try:
+                                    t.header_media = rel_path
+                                    t.save(update_fields=["header_media"])
+                                except Exception:
+                                    pass
+                                return f"{scheme}://{domain}/media/{rel_path}"
+
+            if t_fmt == "video":
+                return "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
+            elif t_fmt == "image":
+                return "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800&fm=jpg&fit=crop&q=80"
+            return ""
 
         data = [
             {
@@ -10256,6 +11240,8 @@ class WhatsAppTemplateAPIView(APIView):
                 "status": t.status,
                 "format": t.format,
                 "header_text": t.header_text,
+                "header_media": _resolve_template_media(t),
+                "media_url": _resolve_template_media(t),
                 "body": t.body,
                 "footer": t.footer,
                 "body_params": t.body_params,
@@ -10265,6 +11251,8 @@ class WhatsAppTemplateAPIView(APIView):
                 "rejected_reason": t.rejected_reason,
                 "channel_name": t.whatsapp_config.channel_name if t.whatsapp_config else "",
                 "phone_number": t.whatsapp_config.phone_number if t.whatsapp_config else "",
+                "config_id": t.whatsapp_config.whatsapp_config_id if t.whatsapp_config else None,
+                "whatsapp_config_id": t.whatsapp_config.whatsapp_config_id if t.whatsapp_config else None,
                 "business_number": f"{t.whatsapp_config.phone_number} · {t.whatsapp_config.channel_name}" if (t.whatsapp_config and t.whatsapp_config.phone_number and t.whatsapp_config.channel_name) else (t.whatsapp_config.phone_number or t.whatsapp_config.channel_name if t.whatsapp_config else "No Channel Linked"),
                 "created_at": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
             }
@@ -10331,18 +11319,22 @@ class WhatsAppTemplateAPIView(APIView):
             return Response({"success": False, "message": "Body content is required."}, status=400)
 
         config_qs = WhatsAppConfig.objects.filter(seller_user=request.user)
+        config = None
+
         if config_id:
             config = config_qs.filter(whatsapp_config_id=config_id).first()
-        elif business_number_input:
-            parts = [p.strip() for p in business_number_input.split("·")]
-            phone_part = parts[0] if len(parts) > 0 else ""
-            chan_part = parts[1] if len(parts) > 1 else ""
-            config = config_qs.filter(phone_number__icontains=phone_part).first()
-            if not config and chan_part:
-                config = config_qs.filter(channel_name__icontains=chan_part).first()
+
+        if not config and business_number_input:
+            config = config_qs.filter(phone_number__icontains=business_number_input).first() or config_qs.filter(channel_name__icontains=business_number_input).first()
             if not config:
-                config = config_qs.first()
-        else:
+                parts = [p.strip() for p in business_number_input.split("·") if p.strip()]
+                for part in parts:
+                    found = config_qs.filter(phone_number__icontains=part).first() or config_qs.filter(channel_name__icontains=part).first()
+                    if found:
+                        config = found
+                        break
+
+        if not config:
             config = config_qs.first()
 
         header_media_file = request.FILES.get("header_media") or request.FILES.get("file") or request.FILES.get("image")
@@ -10534,7 +11526,7 @@ class WhatsAppTemplateAPIView(APIView):
             format=format_type,
             header_text=header_text,
             header_media=saved_rel_media_path or header_media_file,
-            header_handle=header_handle or "",
+            header_handle=str(header_handle or "")[:250],
             body=body_text,
             footer=footer_text,
             body_params=body_params,
@@ -10558,6 +11550,116 @@ class WhatsAppTemplateAPIView(APIView):
         })
 
 
+class WhatsAppMediaUploadAPIView(APIView):
+    """
+    WhatsApp Campaign Header Media Upload & Replacement API
+    POST -> Upload image/video/document file, save to media/whatsapp_media/ and return public URL.
+    Overwrites/replaces previous media file if same template or filename exists.
+    Also updates the seller's WhatsAppTemplate DB record's header_media column!
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import os
+        import re
+        import mimetypes
+        from django.conf import settings
+        from agro_app.models import WhatsAppTemplate, UserRole
+
+        # Register standard MIME types to prevent Meta error #131053 (application/octet-stream)
+        mimetypes.add_type('image/jpeg', '.jpg')
+        mimetypes.add_type('image/jpeg', '.jpeg')
+        mimetypes.add_type('image/png', '.png')
+        mimetypes.add_type('image/webp', '.webp')
+        mimetypes.add_type('video/mp4', '.mp4')
+        mimetypes.add_type('application/pdf', '.pdf')
+
+        if request.user.role.role_id != UserRole.ROLE_SELLER:
+            return Response({"success": False, "message": "Only sellers can upload campaign media."}, status=403)
+
+        media_file = request.FILES.get("file")
+        if not media_file:
+            return Response({"success": False, "message": "No media file provided."}, status=400)
+
+        # Directory setup: media/whatsapp_media/
+        media_dir = os.path.join(settings.MEDIA_ROOT, "whatsapp_media")
+        os.makedirs(media_dir, exist_ok=True)
+
+        template_identifier = (request.POST.get("template_name") or request.POST.get("template_id") or "").strip()
+        original_name = media_file.name
+        content_type = getattr(media_file, "content_type", "") or ""
+
+        # Determine extension cleanly
+        ext = os.path.splitext(original_name)[1].lower()
+        if not ext or ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".pdf", ".doc", ".docx"]:
+            if "png" in content_type:
+                ext = ".png"
+            elif "webp" in content_type:
+                ext = ".webp"
+            elif "mp4" in content_type or "video" in content_type:
+                ext = ".mp4"
+            elif "pdf" in content_type:
+                ext = ".pdf"
+            else:
+                ext = ".jpg"
+
+        # Build clean filename e.g. template_media_card_demo.jpg
+        if template_identifier:
+            clean_tpl_name = re.sub(r'[^a-zA-Z0-9_\-]', '', template_identifier)
+            filename = f"template_media_{clean_tpl_name}{ext}"
+        else:
+            clean_file_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', media_file.name)
+            filename = f"upload_{clean_file_name}"
+
+        file_path = os.path.join(media_dir, filename)
+
+        # Overwrite/replace file cleanly on disk
+        with open(file_path, "wb+") as destination:
+            for chunk in media_file.chunks():
+                destination.write(chunk)
+
+        # Update WhatsAppTemplate DB record's header_media field
+        updated_template_name = None
+        if template_identifier:
+            tpl_db = WhatsAppTemplate.objects.filter(
+                seller_user=request.user,
+                name__iexact=template_identifier
+            ).first()
+            if not tpl_db and template_identifier.isdigit():
+                tpl_db = WhatsAppTemplate.objects.filter(
+                    seller_user=request.user,
+                    template_id=int(template_identifier)
+                ).first()
+
+            if tpl_db:
+                relative_media_path = f"whatsapp_media/{filename}"
+                tpl_db.header_media = relative_media_path
+                tpl_db.save(update_fields=["header_media", "updated_at"])
+                updated_template_name = tpl_db.name
+
+        domain = request.META.get("HTTP_HOST") or "api.qa.syntrrix.com"
+        scheme = "https" if (request.is_secure() or ("api.qa.syntrrix.com" in domain and not any(lh in domain for lh in ["127.0.0.1", "localhost"]))) else "http"
+        media_url = f"{scheme}://{domain}/media/whatsapp_media/{filename}"
+
+        ext_lower = ext.lower()
+        file_type = "image"
+        if ext_lower in [".mp4", ".mov", ".avi", ".mkv"]:
+            file_type = "video"
+        elif ext_lower in [".pdf", ".doc", ".docx", ".xls", ".xlsx"]:
+            file_type = "document"
+
+        return Response({
+            "success": True,
+            "message": "Media uploaded and template database header_media updated successfully.",
+            "media_url": media_url,
+            "file_url": media_url,
+            "relative_url": f"/media/whatsapp_media/{filename}",
+            "filename": filename,
+            "file_type": file_type,
+            "updated_template": updated_template_name,
+        })
+
+
 class WhatsAppTemplateSyncAPIView(APIView):
     """
     Sync templates directly with Meta Graph API
@@ -10574,17 +11676,47 @@ class WhatsAppTemplateSyncAPIView(APIView):
 
         payload = request.data or {}
         config_id = payload.get("config_id")
+        business_number_input = str(payload.get("businessNumber") or payload.get("business_number") or "").strip()
+
         config_qs = WhatsAppConfig.objects.filter(seller_user=request.user)
+        config = None
+
         if config_id:
-            config = config_qs.filter(whatsapp_config_id=config_id).first()
-        else:
+            config = config_qs.filter(whatsapp_config_id=config_id).first() or config_qs.filter(pk=config_id).first()
+
+        if not config and business_number_input:
+            config = config_qs.filter(phone_number__icontains=business_number_input).first() or config_qs.filter(channel_name__icontains=business_number_input).first()
+            if not config:
+                parts = [p.strip() for p in business_number_input.split("·") if p.strip()]
+                for part in parts:
+                    found = config_qs.filter(phone_number__icontains=part).first() or config_qs.filter(channel_name__icontains=part).first()
+                    if found:
+                        config = found
+                        break
+
+        if not config:
+            config = config_qs.filter(is_connected=True).exclude(whatsapp_business_account_id="").exclude(access_token="").first()
+
+        if not config:
+            config = config_qs.exclude(whatsapp_business_account_id="").exclude(access_token="").first()
+
+        if not config:
             config = config_qs.first()
 
-        if not config or not config.whatsapp_business_account_id or not config.access_token:
-            return Response({"success": False, "message": "Active WhatsApp configuration with WABA ID and Access Token is required to sync templates with Meta."}, status=400)
+        waba_id = (config.whatsapp_business_account_id if config else "").strip()
+        token = (config.access_token if config else "").strip()
 
-        waba_id = config.whatsapp_business_account_id
-        token = config.access_token
+        if not waba_id or not token:
+            valid_config = config_qs.exclude(whatsapp_business_account_id="").exclude(access_token="").first()
+            if valid_config:
+                if not waba_id:
+                    waba_id = valid_config.whatsapp_business_account_id
+                if not token:
+                    token = valid_config.access_token
+
+        if not waba_id or not token:
+            return Response({"success": False, "message": "Active WhatsApp configuration with WABA ID and Access Token is required to sync templates with Meta. Please connect WABA account in WhatsApp Channel Settings."}, status=400)
+
         sync_url = f"https://graph.facebook.com/v23.0/{waba_id}/message_templates?fields=id,name,status,category,language,components,quality_score,rejected_reason,created_time&limit=100"
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -10607,14 +11739,35 @@ class WhatsAppTemplateSyncAPIView(APIView):
                     t_body = ""
                     t_header = ""
                     t_footer = ""
+                    t_format = "text"
+                    t_buttons = []
+                    t_header_handle = ""
+
                     for comp in t_components:
-                        c_type = comp.get("type")
+                        c_type = str(comp.get("type") or "").upper()
                         if c_type == "BODY":
                             t_body = comp.get("text") or ""
                         elif c_type == "HEADER":
-                            t_header = comp.get("text") or ""
+                            h_fmt = str(comp.get("format") or "").lower().strip()
+                            if h_fmt in ["image", "video", "document", "text", "location", "carousel"]:
+                                t_format = h_fmt
+                            elif comp.get("text"):
+                                t_format = "text"
+
+                            if comp.get("text"):
+                                t_header = comp.get("text") or ""
+
+                            ex_obj = comp.get("example") or {}
+                            ex_handles = ex_obj.get("header_handle") or ex_obj.get("header_url") or []
+                            if isinstance(ex_handles, list) and len(ex_handles) > 0:
+                                t_header_handle = str(ex_handles[0])
+                            elif isinstance(ex_handles, str) and ex_handles:
+                                t_header_handle = ex_handles
+
                         elif c_type == "FOOTER":
                             t_footer = comp.get("text") or ""
+                        elif c_type == "BUTTONS":
+                            t_buttons = comp.get("buttons") or []
 
                     tmpl, created = WhatsAppTemplate.objects.update_or_create(
                         seller_user=request.user,
@@ -10625,12 +11778,35 @@ class WhatsAppTemplateSyncAPIView(APIView):
                             "category": t_cat,
                             "language": t_lang,
                             "status": t_status,
+                            "format": t_format,
                             "header_text": t_header,
+                            "header_handle": t_header_handle,
                             "body": t_body,
                             "footer": t_footer,
+                            "buttons": t_buttons,
                             "components_json": t_components,
                         }
                     )
+
+                    # Auto-discover local uploaded header media on disk if header_media is empty
+                    if not tmpl.header_media and t_format in ["video", "image", "document"]:
+                        import os, re
+                        from django.conf import settings
+                        clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '', t_name)
+                        search_dirs = [
+                            (os.path.join(settings.MEDIA_ROOT, 'whatsapp_template_headers'), 'whatsapp_template_headers'),
+                            (os.path.join(settings.MEDIA_ROOT, 'whatsapp_media'), 'whatsapp_media')
+                        ]
+                        for s_dir, subfolder in search_dirs:
+                            if os.path.exists(s_dir):
+                                for f_name in os.listdir(s_dir):
+                                    if (clean_name and clean_name.lower() in f_name.lower()) or t_name.lower() in f_name.lower():
+                                        tmpl.header_media = f"{subfolder}/{f_name}"
+                                        tmpl.save(update_fields=["header_media"])
+                                        break
+                            if tmpl.header_media:
+                                break
+
                     synced_count += 1
 
                 return Response({
@@ -10670,19 +11846,17 @@ class WhatsAppCampaignAPIView(APIView):
                     read_val = rec_qs.filter(read_status=True).count()
                     fail_val = rec_qs.filter(sent_status=False).count()
 
-                    read_denom = deliv_val if deliv_val > 0 else (sent_val if sent_val > 0 else aud_val)
-
-                    delivered_str = f"{deliv_val}/{aud_val}"
-                    read_str = f"{read_val}/{read_denom}"
+                    delivered_str = str(deliv_val)
+                    read_str = str(read_val)
                     sent_str = str(sent_val)
                     failed_str = str(fail_val)
                     audience_val = aud_val
                 else:
                     audience_val = c.audience
-                    sent_str = c.sent
-                    delivered_str = c.delivered
-                    read_str = c.read
-                    failed_str = c.failed
+                    sent_str = str(c.sent or "0")
+                    delivered_str = str(c.delivered or "0").split("/")[0].strip()
+                    read_str = str(c.read or "0").split("/")[0].strip()
+                    failed_str = str(c.failed or "0")
 
                 data.append({
                     "id": c.campaign_id,
@@ -10802,8 +11976,26 @@ class WhatsAppCampaignRecipientsAPIView(APIView):
             campaign = WhatsAppCampaign.objects.get(pk=campaign_id, seller_user=request.user)
             recipients = WhatsAppCampaignRecipient.objects.filter(campaign=campaign).order_by("recipient_id")
 
+            import zoneinfo
+            from datetime import timezone as py_timezone, timedelta as py_timedelta
+            try:
+                ist_tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+            except Exception:
+                ist_tz = py_timezone(py_timedelta(hours=5, minutes=30))
+
             data = []
             for r in recipients:
+                if r.timestamp:
+                    if timezone.is_naive(r.timestamp):
+                        ist_time = r.timestamp.replace(tzinfo=ist_tz)
+                    else:
+                        ist_time = r.timestamp.astimezone(ist_tz)
+                    time_str = ist_time.strftime("%I:%M %p · %d/%m/%Y")
+                    iso_time = ist_time.isoformat()
+                else:
+                    time_str = ""
+                    iso_time = ""
+
                 data.append({
                     "id": r.recipient_id,
                     "phone_number": r.phone_number,
@@ -10813,8 +12005,8 @@ class WhatsAppCampaignRecipientsAPIView(APIView):
                     "delivered_status": r.delivered_status,
                     "delivered_error": r.delivered_error,
                     "read_status": r.read_status,
-                    "time": r.timestamp.strftime("%I:%M %p · %m/%d/%Y"),
-                    "timestamp": r.timestamp.isoformat(),
+                    "time": time_str,
+                    "timestamp": iso_time,
                 })
             return Response({"success": True, "count": len(data), "data": data}, status=200)
         except WhatsAppCampaign.DoesNotExist:

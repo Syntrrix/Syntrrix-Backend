@@ -69,17 +69,20 @@ def migrate_existing_files(old_media_root: str, new_persistent_root: str):
 
 def migrate_data_from_old_paths(new_root: str):
     """
-    Copies files from '/var/lib/agrobridge_data' or settings.BASE_DIR/persistent_data
-    into the new_root if they exist, to prevent any data loss when switching paths.
+    Copies existing Data Hub/Live Chat files from legacy data paths
+    (e.g., persistent_data, /var/tmp/agrobridge_data, /var/lib/agrobridge_data)
+    into new_root (media/) to prevent data loss.
     """
     if not new_root:
         return
-    import shutil
     new_root_abs = os.path.abspath(new_root)
     
     old_paths = [
+        os.path.join(str(settings.BASE_DIR), 'persistent_data'),
         '/var/lib/agrobridge_data',
-        os.path.join(str(settings.BASE_DIR), 'persistent_data')
+        '/var/tmp/agrobridge_data',
+        '/home/ubuntu/agrobridge_data',
+        os.path.expanduser('~/agrobridge_data'),
     ]
     
     for old_path in old_paths:
@@ -89,7 +92,7 @@ def migrate_data_from_old_paths(new_root: str):
         if old_path_abs == new_root_abs:
             continue
             
-        logger.info(f"DataHub Migration: Found old data in {old_path_abs}. Migrating to {new_root_abs}...")
+        logger.info(f"DataHub Migration: Checking legacy directory {old_path_abs} for migration to {new_root_abs}...")
         try:
             for folder in ['data_hub', 'live_chat']:
                 src_dir = os.path.join(old_path_abs, folder)
@@ -111,84 +114,42 @@ def migrate_data_from_old_paths(new_root: str):
 
 def get_persistent_data_root() -> str:
     """
-    Resolves the writable local directory to be used for storing JSON data files.
+    Resolves the persistent media directory to be used for storing JSON files.
+    Always uses settings.MEDIA_ROOT (media/ folder).
     """
     global _local_data_root
     if _local_data_root is not None:
         return _local_data_root
 
-    # Try configured PERSISTENT_DATA_ROOT
-    configured_root = getattr(settings, 'PERSISTENT_DATA_ROOT', None)
-    if configured_root:
-        root_path = str(configured_root)
-        try:
-            os.makedirs(root_path, exist_ok=True)
-            _local_data_root = root_path
-            # Trigger migrations
-            migrate_data_from_old_paths(_local_data_root)
-            old_media = getattr(settings, 'MEDIA_ROOT', None)
-            if old_media:
-                migrate_existing_files(str(old_media), _local_data_root)
-            return _local_data_root
-        except Exception as e:
-            logger.warning(f"Configured PERSISTENT_DATA_ROOT ({root_path}) is not writable: {e}. Trying candidates...")
+    media_root = getattr(settings, 'MEDIA_ROOT', None)
+    if not media_root:
+        media_root = os.path.join(str(settings.BASE_DIR), 'media')
+    else:
+        media_root = str(media_root)
 
-    # Autodetect writable persistent paths on Linux/Production
-    if os.name != 'nt':
-        candidate_paths = [
-            '/home/ubuntu/agrobridge_data',
-            '/var/tmp/agrobridge_data',
-            os.path.expanduser('~/agrobridge_data'),
-            '/var/lib/agrobridge_data',
-            # Project root fallback
-            os.path.join(str(settings.BASE_DIR), 'persistent_data')
-        ]
-        for path in candidate_paths:
-            try:
-                os.makedirs(path, exist_ok=True)
-                # Test write capability
-                test_file = os.path.join(path, '.write_test')
-                with open(test_file, 'w') as f:
-                    f.write('test')
-                os.remove(test_file)
-                
-                _local_data_root = path
-                logger.info(f"Auto-detected writable persistent data root: {_local_data_root}")
-                
-                # Trigger migrations
-                migrate_data_from_old_paths(_local_data_root)
-                old_media = getattr(settings, 'MEDIA_ROOT', None)
-                if old_media:
-                    migrate_existing_files(str(old_media), _local_data_root)
-                return _local_data_root
-            except Exception:
-                continue
-
-    # Windows or final fallback
-    fallback_path = os.path.join(str(settings.BASE_DIR), 'persistent_data')
-    os.makedirs(fallback_path, exist_ok=True)
-    _local_data_root = fallback_path
-    logger.info(f"Using default persistent data root: {_local_data_root}")
+    os.makedirs(media_root, exist_ok=True)
+    _local_data_root = os.path.abspath(media_root)
+    logger.info(f"Using persistent media data root: {_local_data_root}")
     
     migrate_data_from_old_paths(_local_data_root)
-    old_media = getattr(settings, 'MEDIA_ROOT', None)
-    if old_media:
-        migrate_existing_files(str(old_media), _local_data_root)
-        
     return _local_data_root
 
 
 def get_data_hub_dir(seller_user_id: int) -> str:
     """
-    Returns the path to the seller's Data Hub directory.
+    Returns the path to the seller's Data Hub directory stored inside media/data_hub/<seller_user_id>.
     """
     root = get_persistent_data_root()
-    return os.path.join(root, "data_hub", str(int(seller_user_id)))
+    data_hub_path = os.path.join(root, "data_hub", str(int(seller_user_id)))
+    os.makedirs(data_hub_path, exist_ok=True)
+    return data_hub_path
 
 
 def get_live_chat_dir() -> str:
     """
-    Returns the path to the Live Chat directory.
+    Returns the path to the Live Chat directory stored inside media/live_chat.
     """
     root = get_persistent_data_root()
-    return os.path.join(root, "live_chat")
+    live_chat_path = os.path.join(root, "live_chat")
+    os.makedirs(live_chat_path, exist_ok=True)
+    return live_chat_path
