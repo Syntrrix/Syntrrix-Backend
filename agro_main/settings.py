@@ -131,10 +131,10 @@ _default_db_host = 'db' if _in_docker else 'localhost'
 DATABASES = {
     'default': {    
         'ENGINE': os.environ.get('DB_ENGINE', 'django.db.backends.mysql'),
-        'NAME': os.environ.get('DB_NAME', 'agro_db'),
-        'USER': os.environ.get('DB_USER', 'root'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', 'root'),
-        'HOST': os.environ.get('DB_HOST', _default_db_host),
+        'NAME': os.environ.get('DB_NAME', 'database-1'),
+        'USER': os.environ.get('DB_USER', 'admin'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', 'b4vmVp&)X2V9'),
+        'HOST': os.environ.get('DB_HOST', 'syntrrix-db.cru0g2ggwfsb.ap-south-1.rds.amazonaws.com'),
         'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
